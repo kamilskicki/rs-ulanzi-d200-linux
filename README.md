@@ -1,3 +1,15 @@
+> **Fork notice.** This is a maintained fork of
+> [glmagalhaes.mail/rs-ulanzi-d-200-linux](https://gitlab.com/glmagalhaes.mail/rs-ulanzi-d-200-linux)
+> (AGPL-3.0, unchanged licence), based on upstream tag `v0.6.5`. Changes in this
+> fork (see commit history and `config.yaml`):
+> - lower key latency: debounced background flush, optional press-feedback
+>   suppression, stored icons with bounded retries, faster PNG encoding;
+> - HID output reports sent with a report-ID byte (`report_id_prefix`) and a
+>   relaxed packet-boundary check (`boundary_check: magic_only`), which removes
+>   the ZIP-rebuild workaround for the "offset 1016 + k*1024" corruption.
+>
+> Branch `upstream-main` mirrors upstream `main`. Fixes are offered upstream.
+
 # OpenDeck Ulanzi D200 Driver (Unofficial)
 
 An unofficial plugin for [OpenDeck](https://github.com/nekename/OpenDeck) that adds support for the Ulanzi D200 and D200H devices.
