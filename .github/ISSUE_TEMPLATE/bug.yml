@@ -1,0 +1,64 @@
+name: Bug report
+description: Something does not work with the Ulanzi D200 / D200H plugin
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Issues for this fork belong here, not in the upstream repository.
+  - type: input
+    id: device
+    attributes:
+      label: Device model
+      placeholder: Ulanzi D200 or D200H
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Device firmware version
+      description: Shown in the Ulanzi Studio app, if you have access to it. Write "unknown" otherwise.
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin version
+      placeholder: "0.7.0"
+    validations:
+      required: true
+  - type: input
+    id: opendeck
+    attributes:
+      label: OpenDeck version
+      placeholder: "2.14.1"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution and kernel
+      description: Output of `uname -r` and your distribution name.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include steps to reproduce (which actions/icons, how often).
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Plugin log excerpt
+      description: |
+        From `~/.local/share/opendeck/logs/plugins/com.glmagalhaes.ulanzi.d200.sdPlugin.log`
+        Please remove anything private.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Changes to config.yaml
+      description: Only the options you changed from the defaults, if any.
+      render: yaml
