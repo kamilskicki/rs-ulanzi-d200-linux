@@ -9,6 +9,19 @@ pub const WINDOW_MODE_STATUS: u8 = 0;
 pub const WINDOW_MODE_CLOCK: u8 = 1;
 pub const WINDOW_MODE_CLEAR: u8 = 2;
 
+/// Which ZIP byte-offset check `build_valid_zip` applies at the start of each continuation packet.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryCheck {
+    /// Retry when a packet would start with 0x00 or 0x7c (original upstream behaviour).
+    #[default]
+    Full,
+    /// Retry only when a packet would start with the 0x7c 0x7c header magic.
+    MagicOnly,
+    /// Never retry.
+    Off,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_brightness")]
@@ -27,6 +40,14 @@ pub struct Config {
     /// Set to false to fall back to the original Deflate behaviour.
     #[serde(default = "default_true")]
     pub zip_stored: bool,
+    /// Prepend a 0x00 report-ID byte to every output report (1025-byte write). hidraw treats the
+    /// first byte as the report ID and strips it when it is 0x00, so without the prefix a packet
+    /// whose first data byte is 0x00 reaches the device one byte short.
+    #[serde(default)]
+    pub report_id_prefix: bool,
+    /// ZIP packet-boundary check: `full`, `magic_only` or `off`.
+    #[serde(default)]
+    pub boundary_check: BoundaryCheck,
     #[serde(skip)]
     pub filepath: Option<std::path::PathBuf>,
 }
@@ -40,6 +61,8 @@ impl Default for Config {
             stats_interval_ms: default_stats_interval(),
             suppress_press_feedback: true,
             zip_stored: true,
+            report_id_prefix: false,
+            boundary_check: BoundaryCheck::Full,
             filepath: None,
         }
     }

@@ -15,6 +15,8 @@ use serde_json::json;
 use tokio::sync::Mutex as TokioMutex;
 use zip::write::FileOptions;
 
+use crate::config::{BoundaryCheck, Config};
+
 use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
 use image::{DynamicImage, GenericImageView, RgbImage, RgbaImage};
 
@@ -33,9 +35,14 @@ pub const NUM_BUTTONS: usize = 14;
 
 const MAX_COMMAND_PAYLOAD: usize = PACKET_SIZE - 8; // 1016
 
-/// Firmware quirk: the device misbehaves when a 0x00 / 0x7c byte lands on the first byte of
+/// Upload quirk: the device misbehaves when a 0x00 / 0x7c byte lands on the first byte of
 /// a 1024-byte upload packet (offsets 1016 + k*1024 of the ZIP).
+/// Suspected cause of the 0x00 case: hidraw strips a leading 0x00 (unnumbered report), so the
+/// packet arrives one byte short; `report_id_prefix` avoids that. The 0x7c case is probably the
+/// device mistaking `HEADER` at a packet start for a new command (`BoundaryCheck::MagicOnly`).
 const INVALID_BYTES: [u8; 2] = [0x00, 0x7c];
+/// Offset of the first continuation-packet byte in the ZIP (first packet = 8-byte header + 1016).
+const FIRST_BOUNDARY: usize = PACKET_SIZE - 8;
 const MAX_RETRIES: usize = 1000;
 
 static FLUSH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -80,6 +87,26 @@ pub struct UlanziDevice {
     /// Snapshot of `button_images` as of the last successful `flush()`.
     flushed_images: Mutex<HashMap<usize, Vec<u8>>>,
     zip_stored: bool,
+    report_id_prefix: bool,
+    boundary_check: BoundaryCheck,
+}
+
+/// Options that change how the driver talks to the device.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceOptions {
+    pub zip_stored: bool,
+    pub report_id_prefix: bool,
+    pub boundary_check: BoundaryCheck,
+}
+
+impl From<&Config> for DeviceOptions {
+    fn from(c: &Config) -> Self {
+        Self {
+            zip_stored: c.zip_stored,
+            report_id_prefix: c.report_id_prefix,
+            boundary_check: c.boundary_check,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,11 +238,77 @@ fn build_zip(
     Ok(cursor.into_inner())
 }
 
-/// The firmware quirk check: no invalid byte at the start of any upload packet.
-fn zip_is_valid(zip: &[u8]) -> bool {
-    (1016..zip.len())
-        .step_by(1024)
-        .all(|offset| !INVALID_BYTES.contains(&zip[offset]))
+/// The upload-boundary check, per `mode`, at the start of every continuation packet.
+fn zip_is_valid(zip: &[u8], mode: BoundaryCheck) -> bool {
+    match mode {
+        BoundaryCheck::Off => true,
+        BoundaryCheck::Full => (FIRST_BOUNDARY..zip.len())
+            .step_by(PACKET_SIZE)
+            .all(|offset| !INVALID_BYTES.contains(&zip[offset])),
+        // A packet starts with the magic when its first two bytes are 0x7c 0x7c. A final
+        // one-byte packet is zero-padded, so a lone trailing 0x7c cannot form it.
+        BoundaryCheck::MagicOnly => (FIRST_BOUNDARY..zip.len())
+            .step_by(PACKET_SIZE)
+            .all(|offset| zip.get(offset..offset + 2) != Some(&HEADER[..])),
+    }
+}
+
+/// Frame one HID output report for `write_output_report`. hidraw takes the first byte as the
+/// report ID; unnumbered devices need it to be 0x00 (the kernel strips it and sends the rest).
+fn frame_report(packet: &[u8], report_id_prefix: bool) -> Vec<u8> {
+    if report_id_prefix {
+        let mut framed = Vec::with_capacity(packet.len() + 1);
+        framed.push(0x00);
+        framed.extend_from_slice(packet);
+        framed
+    } else {
+        packet.to_vec()
+    }
+}
+
+/// The 1024-byte packets of one ZIP upload: first with the 8-byte header, then the
+/// continuation packets (raw data, zero-padded to 1024), as written to the device.
+fn upload_packets(data: &[u8]) -> Vec<Vec<u8>> {
+    let first_chunk = &data[..data.len().min(FIRST_BOUNDARY)];
+    let mut packets = vec![build_packet_raw(
+        CommandProtocol::OutSetButtons,
+        first_chunk,
+        data.len() as u32,
+    )];
+    if data.len() > FIRST_BOUNDARY {
+        for chunk in data[FIRST_BOUNDARY..].chunks(PACKET_SIZE) {
+            let mut packet = vec![0u8; PACKET_SIZE];
+            packet[..chunk.len()].copy_from_slice(chunk);
+            packets.push(packet);
+        }
+    }
+    packets
+}
+
+fn build_packet_raw(command: CommandProtocol, data: &[u8], total_length: u32) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(PACKET_SIZE);
+    packet.extend_from_slice(&HEADER);
+
+    let mut cmd_buf = [0u8; 2];
+    (&mut cmd_buf[..])
+        .write_u16::<BigEndian>(command as u16)
+        .unwrap();
+    packet.extend_from_slice(&cmd_buf);
+
+    // Device expects total_length as little‑endian (working protocol).
+    let mut len_buf = [0u8; 4];
+    (&mut len_buf[..])
+        .write_u32::<LittleEndian>(total_length)
+        .unwrap();
+    packet.extend_from_slice(&len_buf);
+
+    let data_len = data.len().min(PACKET_SIZE - 8);
+    packet.extend_from_slice(&data[..data_len]);
+
+    if packet.len() < PACKET_SIZE {
+        packet.resize(PACKET_SIZE, 0);
+    }
+    packet
 }
 
 /// Build a ZIP that passes `zip_is_valid`, returning it with the number of retries used.
@@ -224,14 +317,27 @@ fn zip_is_valid(zip: &[u8]) -> bool {
 /// Retries spent on the stored layout before switching to deflated icons.
 const STORED_RETRY_BUDGET: usize = 64;
 
-fn build_valid_zip(images: &HashMap<usize, Vec<u8>>, icons_stored: bool) -> Result<(Vec<u8>, usize)> {
+fn build_valid_zip(
+    images: &HashMap<usize, Vec<u8>>,
+    icons_stored: bool,
+    mode: BoundaryCheck,
+) -> Result<(Vec<u8>, usize)> {
     let flush_id = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    find_valid_zip(mode, |pad, stored| build_zip(images, flush_id, pad, stored), icons_stored)
+}
+
+/// The retry loop of `build_valid_zip`, with the archive builder injected.
+fn find_valid_zip(
+    mode: BoundaryCheck,
+    mut build: impl FnMut(usize, bool) -> Result<Vec<u8>>,
+    icons_stored: bool,
+) -> Result<(Vec<u8>, usize)> {
     for pad in 0..MAX_RETRIES {
         // Stored PNG data can be rich in 0x00 bytes; if sliding the stored layout does
         // not find a valid alignment quickly, fall back to deflated icons (near-uniform bytes).
         let stored = icons_stored && pad < STORED_RETRY_BUDGET;
-        let zip = build_zip(images, flush_id, pad, stored)?;
-        if zip_is_valid(&zip) {
+        let zip = build(pad, stored)?;
+        if zip_is_valid(&zip, mode) {
             return Ok((zip, pad));
         }
     }
@@ -244,7 +350,7 @@ fn build_valid_zip(images: &HashMap<usize, Vec<u8>>, icons_stored: bool) -> Resu
 impl UlanziDevice {
     // -- Construction -------------------------------------------------------
 
-    pub async fn connect(zip_stored: bool) -> Result<Self> {
+    pub async fn connect(opts: DeviceOptions) -> Result<Self> {
         let backend = HidBackend::default();
         let devices: Vec<_> = backend.enumerate().await?.collect().await;
 
@@ -272,7 +378,9 @@ impl UlanziDevice {
             id,
             button_images: Mutex::new(HashMap::new()),
             flushed_images: Mutex::new(HashMap::new()),
-            zip_stored,
+            zip_stored: opts.zip_stored,
+            report_id_prefix: opts.report_id_prefix,
+            boundary_check: opts.boundary_check,
         })
     }
 
@@ -358,7 +466,9 @@ impl UlanziDevice {
         );
         match self.writer.try_lock() {
             Ok(mut writer) => {
-                writer.write_output_report(&packet).await?;
+                writer
+                    .write_output_report(&frame_report(&packet, self.report_id_prefix))
+                    .await?;
                 Ok(true)
             }
             Err(_) => Ok(false),
@@ -453,15 +563,25 @@ impl UlanziDevice {
         let images_snapshot = self.button_images.lock().unwrap().clone();
 
         let icons_stored = self.zip_stored;
+        let mode = self.boundary_check;
+        let started = std::time::Instant::now();
         let (zip_data, retries) = {
             let images = images_snapshot.clone();
-            tokio::task::spawn_blocking(move || build_valid_zip(&images, icons_stored)).await??
+            tokio::task::spawn_blocking(move || build_valid_zip(&images, icons_stored, mode)).await??
         };
-        debug!("ZIP archive passed the byte‑offset check ({} retries)", retries);
+        let build_ms = started.elapsed().as_millis();
+        debug!("ZIP archive passed the boundary check ({} retries)", retries);
 
+        let sent = std::time::Instant::now();
         self.send_file(&zip_data).await?;
         *self.flushed_images.lock().unwrap() = images_snapshot;
-        debug!("Successfully sent button configuration ({} bytes)", zip_data.len());
+        info!(
+            "upload ok: {} B, {} attempts, build {} ms, send {} ms",
+            zip_data.len(),
+            retries + 1,
+            build_ms,
+            sent.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -476,59 +596,24 @@ impl UlanziDevice {
             ));
         }
         let packet = self.build_packet(command, payload, payload.len() as u32);
-        self.writer.lock().await.write_output_report(&packet).await?;
+        let framed = frame_report(&packet, self.report_id_prefix);
+        self.writer.lock().await.write_output_report(&framed).await?;
         Ok(())
     }
 
     async fn send_file(&self, data: &[u8]) -> Result<()> {
-        let file_size = data.len() as u32;
-        debug!("Sending icon data! ({} bytes)", file_size);
-        let first_chunk = if data.len() >= 1016 {
-            &data[..1016]
-        } else {
-            data
-        };
-        let first_packet =
-            self.build_packet(CommandProtocol::OutSetButtons, first_chunk, file_size);
-
+        debug!("Sending icon data! ({} bytes)", data.len());
         let mut writer = self.writer.lock().await;
-        writer.write_output_report(&first_packet).await?;
-
-        if data.len() > 1016 {
-            for chunk in data[1016..].chunks(1024) {
-                let mut packet = [0u8; PACKET_SIZE];
-                let len = chunk.len().min(PACKET_SIZE);
-                packet[..len].copy_from_slice(&chunk[..len]);
-                writer.write_output_report(&packet).await?;
-            }
+        for packet in upload_packets(data) {
+            writer
+                .write_output_report(&frame_report(&packet, self.report_id_prefix))
+                .await?;
         }
         Ok(())
     }
 
     fn build_packet(&self, command: CommandProtocol, data: &[u8], total_length: u32) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(PACKET_SIZE);
-        packet.extend_from_slice(&HEADER);
-
-        let mut cmd_buf = [0u8; 2];
-        (&mut cmd_buf[..])
-            .write_u16::<BigEndian>(command as u16)
-            .unwrap();
-        packet.extend_from_slice(&cmd_buf);
-
-        // Device expects total_length as little‑endian (working protocol).
-        let mut len_buf = [0u8; 4];
-        (&mut len_buf[..])
-            .write_u32::<LittleEndian>(total_length)
-            .unwrap();
-        packet.extend_from_slice(&len_buf);
-
-        let data_len = data.len().min(PACKET_SIZE - 8);
-        packet.extend_from_slice(&data[..data_len]);
-
-        if packet.len() < PACKET_SIZE {
-            packet.resize(PACKET_SIZE, 0);
-        }
-        packet
+        build_packet_raw(command, data, total_length)
     }
 }
 
@@ -607,24 +692,169 @@ mod tests {
 
     #[test]
     fn zip_validity_only_looks_at_packet_start_bytes() {
+        let full = BoundaryCheck::Full;
         let mut data = vec![1u8; 4000];
-        assert!(zip_is_valid(&data));
+        assert!(zip_is_valid(&data, full));
 
         data[1017] = 0x00; // not a packet start
         data[1016 + 5] = 0x7c;
-        assert!(zip_is_valid(&data));
+        assert!(zip_is_valid(&data, full));
 
         data[1016] = 0x00;
-        assert!(!zip_is_valid(&data));
+        assert!(!zip_is_valid(&data, full));
         data[1016] = 1;
 
         data[1016 + 1024] = 0x7c;
-        assert!(!zip_is_valid(&data));
+        assert!(!zip_is_valid(&data, full));
         data[1016 + 1024] = 1;
 
         data[1016 + 2 * 1024] = 0x00; // 3064: the last packet start inside 4000 bytes
-        assert!(!zip_is_valid(&data));
-        assert!(zip_is_valid(&[0u8; 1016])); // nothing at or after the first checked offset
+        assert!(!zip_is_valid(&data, full));
+        assert!(zip_is_valid(&[0u8; 1016], full)); // nothing at or after the first checked offset
+    }
+
+    #[test]
+    fn boundary_check_modes() {
+        let (full, magic, off) = (BoundaryCheck::Full, BoundaryCheck::MagicOnly, BoundaryCheck::Off);
+        let at = |bytes: &[u8], offset: usize| {
+            let mut d = vec![1u8; 4000];
+            d[offset..offset + bytes.len()].copy_from_slice(bytes);
+            d
+        };
+        // lone 0x00 at a packet start: only `full` retries
+        let d = at(&[0x00], 1016);
+        assert!(!zip_is_valid(&d, full) && zip_is_valid(&d, magic) && zip_is_valid(&d, off));
+        // lone 0x7c: only `full` retries
+        let d = at(&[0x7c, 0x01], 2040);
+        assert!(!zip_is_valid(&d, full) && zip_is_valid(&d, magic) && zip_is_valid(&d, off));
+        // 0x00 0x7c is not the magic
+        let d = at(&[0x00, 0x7c], 3064);
+        assert!(!zip_is_valid(&d, full) && zip_is_valid(&d, magic));
+        // 0x7c 0x7c at a packet start: `full` and `magic_only` retry, `off` does not
+        for offset in [1016, 2040, 3064] {
+            let d = at(&[0x7c, 0x7c], offset);
+            assert!(!zip_is_valid(&d, full) && !zip_is_valid(&d, magic) && zip_is_valid(&d, off));
+        }
+        // 0x7c 0x7c off the packet grid is irrelevant
+        let d = at(&[0x7c, 0x7c], 1500);
+        assert!(zip_is_valid(&d, full) && zip_is_valid(&d, magic));
+        // a lone trailing 0x7c (zero-padded final packet) cannot form the magic
+        let mut d = vec![1u8; 1016 + 1024 + 1];
+        *d.last_mut().unwrap() = 0x7c;
+        assert!(!zip_is_valid(&d, full) && zip_is_valid(&d, magic));
+    }
+
+    #[test]
+    fn boundary_check_config_names() {
+        let c: Config = serde_yaml::from_str("boundary_check: magic_only\nreport_id_prefix: true").unwrap();
+        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::MagicOnly, true));
+        let c: Config = serde_yaml::from_str("boundary_check: off").unwrap();
+        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::Off, false));
+        let c: Config = serde_yaml::from_str("brightness: 50").unwrap();
+        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::Full, false)); // upstream defaults
+    }
+
+    /// Model of the kernel hidraw/usbhid path for an unnumbered-report device: the first byte
+    /// is the report ID and a 0x00 is dropped, everything else goes on the wire as written.
+    fn wire_bytes(write_buf: &[u8]) -> &[u8] {
+        if write_buf[0] == 0x00 { &write_buf[1..] } else { write_buf }
+    }
+
+    #[test]
+    fn upload_packets_layout() {
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8 + 1).collect();
+        let packets = upload_packets(&data);
+        assert_eq!(packets.len(), 3); // 1016 + 1024 + 960
+        assert!(packets.iter().all(|p| p.len() == PACKET_SIZE));
+        assert_eq!(packets[0][..2], HEADER);
+        assert_eq!(&packets[0][2..4], &(CommandProtocol::OutSetButtons as u16).to_be_bytes());
+        assert_eq!(&packets[0][4..8], &3000u32.to_le_bytes());
+        assert_eq!(&packets[0][8..], &data[..1016]);
+        // continuation packets start exactly at the checked offsets 1016 + k*1024
+        assert_eq!(packets[1][0], data[1016]);
+        assert_eq!(packets[2][0], data[1016 + 1024]);
+        let mut joined = packets[0][8..].to_vec();
+        packets[1..].iter().for_each(|p| joined.extend_from_slice(p));
+        assert_eq!(&joined[..3000], &data[..]);
+        assert!(joined[3000..].iter().all(|&b| b == 0)); // zero padding
+        // small payload: one packet
+        assert_eq!(upload_packets(&[1, 2, 3]).len(), 1);
+        assert_eq!(upload_packets(&vec![1u8; 1016]).len(), 1);
+        assert_eq!(upload_packets(&vec![1u8; 1017]).len(), 2);
+    }
+
+    #[test]
+    fn report_id_prefix_framing() {
+        let mut data = vec![1u8; 3000];
+        data[1016] = 0x00; // packet 1 starts with 0x00
+        data[1016 + 1024] = 0x7c; // packet 2 starts with 0x7c
+        let packets = upload_packets(&data);
+
+        for p in &packets {
+            // without prefix: written verbatim, 1024 bytes
+            let plain = frame_report(p, false);
+            assert_eq!(plain, *p);
+            // with prefix: 0x00 + packet, 1025 bytes
+            let framed = frame_report(p, true);
+            assert_eq!(framed.len(), PACKET_SIZE + 1);
+            assert_eq!(framed[0], 0x00);
+            assert_eq!(&framed[1..], &p[..]);
+            // with the prefix the device always receives the full, unchanged 1024-byte packet
+            assert_eq!(wire_bytes(&framed), &p[..]);
+        }
+        // without the prefix, a packet starting with 0x00 is truncated by one byte (the hypothesis)
+        assert_eq!(wire_bytes(&frame_report(&packets[1], false)).len(), PACKET_SIZE - 1);
+        assert_eq!(wire_bytes(&frame_report(&packets[0], false)).len(), PACKET_SIZE);
+        assert_eq!(wire_bytes(&frame_report(&packets[2], false)).len(), PACKET_SIZE);
+    }
+
+    #[test]
+    fn magic_only_accepts_zero_boundaries_on_first_attempt() {
+        // Archive with 0x00 on every continuation-packet start (but no 7c 7c pair), and a variant
+        // of the same builder that only clears those bytes after 5 padding bytes.
+        let build = |pad: usize, _stored: bool| -> Result<Vec<u8>> {
+            let mut d = vec![0x42u8; 20 * 1024];
+            if pad < 5 {
+                for off in (FIRST_BOUNDARY..d.len()).step_by(PACKET_SIZE) {
+                    d[off] = 0x00;
+                }
+            }
+            Ok(d)
+        };
+        let (_, retries) = find_valid_zip(BoundaryCheck::Full, build, true).unwrap();
+        assert_eq!(retries, 5); // full: retries until the zeros are gone
+        let (zip, retries) = find_valid_zip(BoundaryCheck::MagicOnly, build, true).unwrap();
+        assert_eq!(retries, 0); // magic_only: accepted at once
+        assert_eq!(zip[FIRST_BOUNDARY], 0x00);
+        assert_eq!(find_valid_zip(BoundaryCheck::Off, build, true).unwrap().1, 0);
+
+        // 7c 7c at a boundary still forces a retry in magic_only
+        let build_magic = |pad: usize, _stored: bool| -> Result<Vec<u8>> {
+            let mut d = vec![0x42u8; 20 * 1024];
+            if pad < 3 {
+                d[FIRST_BOUNDARY + PACKET_SIZE] = 0x7c;
+                d[FIRST_BOUNDARY + PACKET_SIZE + 1] = 0x7c;
+            }
+            Ok(d)
+        };
+        assert_eq!(find_valid_zip(BoundaryCheck::MagicOnly, build_magic, true).unwrap().1, 3);
+    }
+
+    #[test]
+    fn real_zips_with_zero_boundaries_pass_magic_only_first_try() {
+        // Real archives: zero the boundary bytes of a freshly built ZIP (content is irrelevant to
+        // the check) and confirm each mode's verdict.
+        let images = sample_images();
+        let mut zip = build_zip(&images, 99, 0, true).unwrap();
+        for off in (FIRST_BOUNDARY..zip.len()).step_by(PACKET_SIZE) {
+            zip[off] = 0x00;
+            if off + 1 < zip.len() && zip[off + 1] == 0x7c {
+                zip[off + 1] = 0x01;
+            }
+        }
+        assert!(zip.len() > 3 * PACKET_SIZE);
+        assert!(!zip_is_valid(&zip, BoundaryCheck::Full));
+        assert!(zip_is_valid(&zip, BoundaryCheck::MagicOnly));
     }
 
     #[test]
@@ -695,10 +925,15 @@ mod tests {
     fn build_valid_zip_passes_the_firmware_check() {
         let images = sample_images();
         for _ in 0..20 {
-            let (data, retries) = build_valid_zip(&images, true).unwrap();
-            assert!(zip_is_valid(&data));
+            let (data, retries) = build_valid_zip(&images, true, BoundaryCheck::Full).unwrap();
+            assert!(zip_is_valid(&data, BoundaryCheck::Full));
             assert!(retries < MAX_RETRIES);
             open_zip(&data); // still a readable ZIP after padding
+        }
+        for mode in [BoundaryCheck::MagicOnly, BoundaryCheck::Off] {
+            let (data, _) = build_valid_zip(&images, true, mode).unwrap();
+            assert!(zip_is_valid(&data, mode));
+            open_zip(&data);
         }
     }
 
@@ -761,7 +996,7 @@ mod tests {
                 zip.finish().unwrap();
             }
             let data = cursor.into_inner();
-            if zip_is_valid(&data) {
+            if zip_is_valid(&data, BoundaryCheck::Full) {
                 return (data, retries);
             }
             retries += 1;
@@ -834,6 +1069,6 @@ mod tests {
             new_images.values().map(Vec::len).sum::<usize>()
         );
         run("before (deflate + random dummy, rebuild per retry)", &|| legacy_build_valid_zip(&old_images));
-        run("after  (stored + 1-byte padding steps)           ", &|| build_valid_zip(&new_images, true).unwrap());
+        run("after  (stored + 1-byte padding steps)           ", &|| build_valid_zip(&new_images, true, BoundaryCheck::Full).unwrap());
     }
 }

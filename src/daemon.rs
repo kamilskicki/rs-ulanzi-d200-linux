@@ -13,7 +13,7 @@ use crate::config::WINDOW_MODE_STATUS;
 use crate::config::WINDOW_MODE_CLOCK;
 use crate::config::WINDOW_MODE_CLEAR;
 use crate::config::Config;
-use crate::device::{ButtonEvent, UlanziDevice};
+use crate::device::{ButtonEvent, DeviceOptions, UlanziDevice};
 use crate::openaction_client::BridgeEvent;
 use crate::press_filter::PressFilter;
 use crate::system_monitor::SystemMonitor;
@@ -60,7 +60,7 @@ impl UlanziDaemon {
         let mut devices = HashMap::new();
 
         // Try to connect to the first available device
-        match UlanziDevice::connect(config.zip_stored).await {
+        match UlanziDevice::connect(DeviceOptions::from(&config)).await {
             Ok(device) => {
                 devices.insert(device.get_id().to_string(), Arc::new(device));
             }
@@ -95,8 +95,11 @@ impl UlanziDaemon {
 
     pub async fn run(mut self) -> Result<()> {
         info!(
-            "Ulanzi Daemon started (debounced flush, suppress_press_feedback={}, zip_stored={})",
-            self.config.suppress_press_feedback, self.config.zip_stored
+            "Ulanzi Daemon started (debounced flush, suppress_press_feedback={}, zip_stored={}, report_id_prefix={}, boundary_check={:?})",
+            self.config.suppress_press_feedback,
+            self.config.zip_stored,
+            self.config.report_id_prefix,
+            self.config.boundary_check
         );
 
         // --- Initial device setup for all connected devices ---

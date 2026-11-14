@@ -5,3 +5,7 @@ display_mode: 0 #INDOW_MODE_STATUS: u8 = 0
 # Latency options (both default to true; set to false for the original behaviour)
 suppress_press_feedback: true  # drop OpenDeck's shrunken "pressed" frame, skip no-op flushes
 zip_stored: true               # store PNGs uncompressed in the upload ZIP (they are already compressed)
+
+# Upload framing (fork patch 2026-11-14; code defaults are upstream-compatible: false / full)
+report_id_prefix: true         # prepend 0x00 report ID to every HID write (hidraw strips it; stops 0x00-start packets being sent short)
+boundary_check: magic_only     # full = retry on 0x00/0x7c packet start, magic_only = only on 7c 7c, off = never
