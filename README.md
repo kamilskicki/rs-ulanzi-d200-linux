@@ -4,8 +4,8 @@ A maintained fork of the unofficial [OpenDeck](https://github.com/nekename/OpenD
 Ulanzi D200 and D200H stream controllers. It is a Rust program that speaks the device's HID protocol
 and bridges it to OpenDeck.
 
-This fork exists because the original driver corrupts button icons on some uploads and works around it
-with a costly rebuild loop. The fork fixes the cause, lowers key latency, and ships tested defaults.
+This fork corrects HID output framing and changes upload scheduling and ZIP construction. Hardware
+observations currently cover one D200H with Linux and OpenDeck 2.14.1.
 
 - Upstream project: [glmagalhaes.mail/rs-ulanzi-d-200-linux](https://gitlab.com/glmagalhaes.mail/rs-ulanzi-d-200-linux)
   (by glmagalhaes, mquest and mtesseract). All credit for the driver itself goes to them.
@@ -16,20 +16,20 @@ with a costly rebuild loop. The fork fixes the cause, lowers key latency, and sh
 
 Based on upstream `v0.6.5`; see [CHANGELOG.md](CHANGELOG.md) for the full list.
 
-**Root cause of the "offset 1016 + k*1024" corruption.** Button images are uploaded as a ZIP split into
-1024-byte HID output reports. On Linux, `hidraw` treats the first byte of every write as the *report ID*
-and, when it is `0x00`, strips it (the device uses unnumbered reports). Any packet whose first data byte
-happened to be `0x00` therefore reached the device one byte short, which corrupted the archive; this
-only affects ZIP offsets `1016 + k*1024`, where a new packet starts. Upstream avoided it by rebuilding
-the ZIP until no packet started with `0x00` or `0x7c`. The fork instead writes every report with an
-explicit leading `0x00` report-ID byte (`report_id_prefix`), so no data byte is ever dropped, and only
-retries when a packet would start with the `7c 7c` header magic (`boundary_check: magic_only`).
+**HID output framing.** Button images are uploaded as a ZIP split into 1024-byte HID output reports.
+The device uses unnumbered reports, and on Linux the first byte of every write is treated as the report
+ID: a leading zero in an unprefixed continuation packet is consumed by the USB HID output path,
+shortening that packet. Continuation packets start at ZIP offsets `1016 + k*1024`. Upstream `v0.6.5`
+rebuilds the ZIP until no continuation starts with `0x00` or `0x7c` (current upstream `main` starts that
+check at offset 92152). The fork supplies an explicit zero report ID (`report_id_prefix`) and retains a
+precautionary `7c 7c` guard (`boundary_check: magic_only`); whether the firmware actually misreads such a
+continuation as a header remains unconfirmed.
 
-Other changes: debounced background flush so key events are never blocked by an upload, PNGs stored
-instead of re-deflated, bounded padding steps instead of full rebuilds, no Windows code paths, and a
-faster test suite.
+**Uploads.** Uploads run in a background task, so key events are not blocked by an upload. ZIP retries
+still rebuild the archive, using bounded padding increments. PNG storage initially avoids recompression,
+with a deflated fallback. Windows code paths were removed and the test suite is faster.
 
-## Supported hardware and software
+
 
 | | Status |
 |---|---|
