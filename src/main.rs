@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod device;
 mod openaction_client;
+mod press_filter;
 mod system_monitor;
 mod action;
 

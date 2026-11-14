@@ -19,6 +19,14 @@ pub struct Config {
     pub display_mode: u8,
     #[serde(default = "default_stats_interval")]
     pub stats_interval_ms: u64,
+    /// Ignore OpenDeck's shrunken "pressed" key frame and skip flushes that would
+    /// re-upload exactly what the device already shows.
+    #[serde(default = "default_true")]
+    pub suppress_press_feedback: bool,
+    /// Store the (already compressed) PNG icons in the ZIP instead of deflating them again.
+    /// Set to false to fall back to the original Deflate behaviour.
+    #[serde(default = "default_true")]
+    pub zip_stored: bool,
     #[serde(skip)]
     pub filepath: Option<std::path::PathBuf>,
 }
@@ -30,6 +38,8 @@ impl Default for Config {
             label_style: HashMap::new(),
             display_mode: default_display_mode(),
             stats_interval_ms: default_stats_interval(),
+            suppress_press_feedback: true,
+            zip_stored: true,
             filepath: None,
         }
     }
@@ -43,6 +53,9 @@ fn default_display_mode() -> u8 {
 }
 fn default_stats_interval() -> u64 {
     1000
+}
+fn default_true() -> bool {
+    true
 }
 
 

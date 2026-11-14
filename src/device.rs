@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_hid::{AsyncHidWrite, DeviceReader, DeviceWriter, HidBackend};
@@ -10,12 +9,13 @@ use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
 use data_url::DataUrl;
 use futures_util::StreamExt;
 use log::{debug, info, warn};
-use rand::{rngs, RngExt, distr::Alphanumeric};
+use rand::rngs;
 use rand::seq::SliceRandom;
 use serde_json::json;
 use tokio::sync::Mutex as TokioMutex;
 use zip::write::FileOptions;
 
+use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
 use image::{DynamicImage, GenericImageView, RgbImage, RgbaImage};
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,11 @@ const USAGE_PAGE: u16 = 0x000c;
 pub const NUM_BUTTONS: usize = 14;
 
 const MAX_COMMAND_PAYLOAD: usize = PACKET_SIZE - 8; // 1016
+
+/// Firmware quirk: the device misbehaves when a 0x00 / 0x7c byte lands on the first byte of
+/// a 1024-byte upload packet (offsets 1016 + k*1024 of the ZIP).
+const INVALID_BYTES: [u8; 2] = [0x00, 0x7c];
+const MAX_RETRIES: usize = 1000;
 
 static FLUSH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -68,9 +73,13 @@ pub struct ButtonEvent {
 
 pub struct UlanziDevice {
     writer: Arc<TokioMutex<DeviceWriter>>,
-    reader: Option<DeviceReader>,
+    reader: Mutex<Option<DeviceReader>>,
     id: String,
+    /// Images staged by `set_button_image`, sent on the next `flush()`.
     button_images: Mutex<HashMap<usize, Vec<u8>>>,
+    /// Snapshot of `button_images` as of the last successful `flush()`.
+    flushed_images: Mutex<HashMap<usize, Vec<u8>>>,
+    zip_stored: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,10 +126,125 @@ fn resize_square(img: &DynamicImage, size: u32) -> DynamicImage {
     }
 }
 
+/// Encode as PNG. The upload ZIP carries these bytes verbatim, so spend CPU once here
+/// (the `image` default is the fast, weak fdeflate mode) to shrink every later upload.
+fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Default, PngFilter::Adaptive);
+    img.write_with_encoder(encoder)?;
+    Ok(buf)
+}
+
+/// Build the button-configuration ZIP. `pad` bytes of filler go into a leading, always
+/// stored `dummy.txt`, which shifts everything after it (see `build_valid_zip`).
+/// Icon names carry `flush_id` so the device reloads them on every flush.
+fn build_zip(
+    images: &HashMap<usize, Vec<u8>>,
+    flush_id: u64,
+    pad: usize,
+    icons_stored: bool,
+) -> Result<Vec<u8>> {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let stored =
+            FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+        let deflated =
+            FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
+        // PNGs are already compressed; deflating them again only burns CPU.
+        let icon_options = if icons_stored { stored } else { deflated };
+
+        // Padding must stay stored (deflate would squash it to nothing) and must not
+        // contain invalid bytes, as it can span checked offsets.
+        zip.start_file("dummy.txt", stored)?;
+        zip.write_all(&vec![b'x'; pad])?;
+
+        let mut manifest = json!({});
+
+        let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
+        numbers.shuffle(&mut rngs::ThreadRng::default());
+        for i in numbers {
+            if i == 13 {
+                let key1 = "3_2";
+                let key2 = "4_2";
+                let mut view_param = json!({ "Text": "" });
+
+                if let Some(img_data) = images.get(&13) {
+                    let icon_name = format!("{}_{}.png", i, flush_id);
+                    zip.start_file(format!("icons/{}", icon_name), icon_options)?;
+                    zip.write_all(img_data)?;
+                    view_param["Icon"] = json!(format!("icons/{}", icon_name));
+                } else {
+                    view_param["Icon"] = json!("");
+                }
+
+                let entry = json!({ "State": 0, "ViewParam": [view_param] });
+                manifest[key1] = entry.clone();
+                manifest[key2] = entry;
+            } else {
+                let col = i % 5;
+                let row = i / 5;
+                let key = format!("{}_{}", col, row);
+                let mut view_param = json!({ "Text": "" });
+
+                if let Some(img_data) = images.get(&i) {
+                    let icon_name = format!("{}_{}.png", i, flush_id);
+                    zip.start_file(format!("icons/{}", icon_name), icon_options)?;
+                    zip.write_all(img_data)?;
+                    view_param["Icon"] = json!(format!("icons/{}", icon_name));
+                } else {
+                    view_param["Icon"] = json!("");
+                }
+
+                manifest[key] = json!({ "State": 0, "ViewParam": [view_param] });
+            }
+        }
+
+        zip.start_file("manifest.json", deflated)?;
+        zip.write_all(serde_json::to_string(&manifest)?.as_bytes())?;
+
+        zip.start_file("sentinel.txt", deflated)?;
+        zip.write_all(b"")?;
+
+        zip.finish()?;
+    }
+    Ok(cursor.into_inner())
+}
+
+/// The firmware quirk check: no invalid byte at the start of any upload packet.
+fn zip_is_valid(zip: &[u8]) -> bool {
+    (1016..zip.len())
+        .step_by(1024)
+        .all(|offset| !INVALID_BYTES.contains(&zip[offset]))
+}
+
+/// Build a ZIP that passes `zip_is_valid`, returning it with the number of retries used.
+/// Each retry only grows the stored filler by one byte, which slides all later data
+/// against the 1024-byte packet grid; nothing is recompressed. Bounded by `MAX_RETRIES`.
+/// Retries spent on the stored layout before switching to deflated icons.
+const STORED_RETRY_BUDGET: usize = 64;
+
+fn build_valid_zip(images: &HashMap<usize, Vec<u8>>, icons_stored: bool) -> Result<(Vec<u8>, usize)> {
+    let flush_id = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    for pad in 0..MAX_RETRIES {
+        // Stored PNG data can be rich in 0x00 bytes; if sliding the stored layout does
+        // not find a valid alignment quickly, fall back to deflated icons (near-uniform bytes).
+        let stored = icons_stored && pad < STORED_RETRY_BUDGET;
+        let zip = build_zip(images, flush_id, pad, stored)?;
+        if zip_is_valid(&zip) {
+            return Ok((zip, pad));
+        }
+    }
+    Err(anyhow!(
+        "Failed to build a valid ZIP after {} retries – giving up",
+        MAX_RETRIES
+    ))
+}
+
 impl UlanziDevice {
     // -- Construction -------------------------------------------------------
 
-    pub async fn connect() -> Result<Self> {
+    pub async fn connect(zip_stored: bool) -> Result<Self> {
         let backend = HidBackend::default();
         let devices: Vec<_> = backend.enumerate().await?.collect().await;
 
@@ -144,9 +268,11 @@ impl UlanziDevice {
 
         Ok(Self {
             writer: Arc::new(TokioMutex::new(writer)),
-            reader: Some(reader),
+            reader: Mutex::new(Some(reader)),
             id,
             button_images: Mutex::new(HashMap::new()),
+            flushed_images: Mutex::new(HashMap::new()),
+            zip_stored,
         })
     }
 
@@ -163,8 +289,13 @@ impl UlanziDevice {
         &self.id
     }
 
-    pub fn take_reader(&mut self) -> Option<DeviceReader> {
-        self.reader.take()
+    pub fn take_reader(&self) -> Option<DeviceReader> {
+        self.reader.lock().unwrap().take()
+    }
+
+    /// True if the staged images differ from what the last flush put on the device.
+    pub fn needs_flush(&self) -> bool {
+        *self.button_images.lock().unwrap() != *self.flushed_images.lock().unwrap()
     }
 
     // -- Report parsing -----------------------------------------------------
@@ -209,6 +340,31 @@ impl UlanziDevice {
             .await
     }
 
+    /// Like `set_small_window_data`, but gives up instead of waiting when the HID writer is
+    /// busy (e.g. a ZIP upload is in progress). Returns whether the update was sent.
+    pub async fn try_set_small_window_data(
+        &self,
+        mode: u8,
+        cpu: u8,
+        mem: u8,
+        time_str: &str,
+        gpu: u8,
+    ) -> Result<bool> {
+        let payload = format!("{}|{}|{}|{}|{}", mode, cpu, mem, time_str, gpu).into_bytes();
+        let packet = self.build_packet(
+            CommandProtocol::OutSetSmallWindowData,
+            &payload,
+            payload.len() as u32,
+        );
+        match self.writer.try_lock() {
+            Ok(mut writer) => {
+                writer.write_output_report(&packet).await?;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
     pub async fn set_brightness(&self, brightness: u8) -> Result<()> {
         let brightness = brightness.min(100);
         let payload = brightness.to_string().into_bytes();
@@ -247,13 +403,7 @@ impl UlanziDevice {
                 .decode_to_vec()
                 .map_err(|_| anyhow!("Failed to decode data URL"))?;
             let img = image::load_from_memory(&body)?;
-            let resized = resize_square(&img, 196);
-            let mut buf = Vec::new();
-            {
-                let mut cursor = Cursor::new(&mut buf);
-                resized.write_to(&mut cursor, image::ImageFormat::Png)?;
-            }
-            buf
+            encode_png(&resize_square(&img, 196))?
         } else {
             // File path
             let path = std::path::Path::new(image_data);
@@ -262,13 +412,7 @@ impl UlanziDevice {
             }
             let img = image::open(path)
                 .map_err(|e| anyhow!("Failed to open image {}: {}", image_data, e))?;
-            let resized = resize_square(&img, 196);
-            let mut buf = Vec::new();
-            {
-                let mut cursor = Cursor::new(&mut buf);
-                resized.write_to(&mut cursor, image::ImageFormat::Png)?;
-            }
-            buf
+            encode_png(&resize_square(&img, 196))?
         };
 
         let mut map = self.button_images.lock().unwrap();
@@ -306,122 +450,17 @@ impl UlanziDevice {
     pub async fn flush(&self) -> Result<()> {
         debug!("Building button configuration ZIP with bug workaround");
 
-        let images_snapshot = {
-            let map = self.button_images.lock().unwrap();
-            map.clone()
+        let images_snapshot = self.button_images.lock().unwrap().clone();
+
+        let icons_stored = self.zip_stored;
+        let (zip_data, retries) = {
+            let images = images_snapshot.clone();
+            tokio::task::spawn_blocking(move || build_valid_zip(&images, icons_stored)).await??
         };
-
-        const INVALID_BYTES: [u8; 2] = [0x00, 0x7c];
-        const MAX_RETRIES: usize = 1000;
-
-        let mut dummy_retries = 0;
-        let mut zip_data = Vec::new();
-
-        loop {
-            let flush_id = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
-            zip_data.clear();
-            let mut cursor = Cursor::new(Vec::new());
-            {
-                let mut zip = zip::ZipWriter::new(&mut cursor);
-                let stored = FileOptions::<()>::default()
-                    .compression_method(zip::CompressionMethod::Stored);
-                let deflated = FileOptions::<()>::default()
-                    .compression_method(zip::CompressionMethod::Deflated);
-
-                // Dummy file – content grows aggressively
-                // let dummy_content = "x".repeat(128 * dummy_retries);
-                let dummy_content: String = rngs::ThreadRng::default()
-                    .sample_iter(&Alphanumeric)
-                    .take(237 * dummy_retries)
-                    .map(char::from)
-                    .collect();
-
-                zip.start_file("dummy.txt", deflated)?;
-                zip.write_all(dummy_content.as_bytes())?;
-
-                let mut manifest = json!({});
-
-                let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
-                numbers.shuffle(&mut rngs::ThreadRng::default());
-                for i in numbers {
-                    if i == 13 {
-                        let key1 = "3_2";
-                        let key2 = "4_2";
-                        let mut view_param = json!({ "Text": "" });
-
-                        if let Some(img_data) = images_snapshot.get(&13) {
-                            let icon_name = format!("{}_{}.png", i, flush_id);
-                            zip.start_file(format!("icons/{}", icon_name), deflated)?;
-                            zip.write_all(img_data)?;
-                            view_param["Icon"] = json!(format!("icons/{}", icon_name));
-                        } else {
-                            view_param["Icon"] = json!("");
-                        }
-
-                        let entry = json!({ "State": 0, "ViewParam": [view_param] });
-                        manifest[key1] = entry.clone();
-                        manifest[key2] = entry;
-                    } else {
-                        let col = i % 5;
-                        let row = i / 5;
-                        let key = format!("{}_{}", col, row);
-                        let mut view_param = json!({ "Text": "" });
-
-                        if let Some(img_data) = images_snapshot.get(&i) {
-                            let icon_name = format!("{}_{}.png", i, flush_id);
-                            zip.start_file(format!("icons/{}", icon_name), deflated)?;
-                            zip.write_all(img_data)?;
-                            view_param["Icon"] = json!(format!("icons/{}", icon_name));
-                        } else {
-                            view_param["Icon"] = json!("");
-                        }
-
-                        manifest[key] = json!({ "State": 0, "ViewParam": [view_param] });
-                    }
-                }
-
-                zip.start_file("manifest.json", deflated)?;
-                zip.write_all(serde_json::to_string(&manifest)?.as_bytes())?;
-
-                zip.start_file("sentinel.txt", deflated)?;
-                zip.write_all(b"")?;
-
-                zip.finish()?;
-            }
-
-            zip_data = cursor.into_inner();
-
-            let file_size = zip_data.len();
-            let mut valid = true;
-            for offset in (1016..file_size).step_by(1024) {
-                if let Some(&byte) = zip_data.get(offset) {
-                    if INVALID_BYTES.contains(&byte) {
-                        debug!(
-                            "Invalid byte 0x{:02x} at offset {} (retry {})",
-                            byte, offset, dummy_retries
-                        );
-                        valid = false;
-                        break;
-                    }
-                }
-            }
-
-            if valid {
-                debug!("ZIP archive passed the byte‑offset check ({} retries)", dummy_retries);
-                break;
-            }
-
-            dummy_retries += 1;
-            if dummy_retries >= MAX_RETRIES {
-                return Err(anyhow!(
-                    "Failed to build a valid ZIP after {} retries – giving up",
-                    MAX_RETRIES
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        debug!("ZIP archive passed the byte‑offset check ({} retries)", retries);
 
         self.send_file(&zip_data).await?;
+        *self.flushed_images.lock().unwrap() = images_snapshot;
         debug!("Successfully sent button configuration ({} bytes)", zip_data.len());
         Ok(())
     }
@@ -507,5 +546,294 @@ mod tests {
     fn test_generate_id_without_serial() {
         let id = UlanziDevice::generate_id(None, "fallback");
         assert_eq!(id, "e9-fallback");
+    }
+
+    // -- ZIP builder / PNG encoder ---------------------------------------------
+
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use image::codecs::jpeg::JpegEncoder;
+
+    /// Optional real-icon fixtures: set D200_TEST_ICON_DIR; tests using them are skipped otherwise.
+    fn icon_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("D200_TEST_ICON_DIR").map(std::path::PathBuf::from)
+    }
+
+    /// Deterministic 196x196 PNG (gradient + LCG noise), so most tests need no fixtures.
+    fn synthetic_png(seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
+        let img = RgbImage::from_fn(196, 196, |x, y| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = (state >> 24) as u8 % 16;
+            image::Rgb([
+                (x as u8).wrapping_add(noise),
+                (y as u8).wrapping_add(noise),
+                (seed as u8).wrapping_add(noise),
+            ])
+        });
+        encode_png(&DynamicImage::ImageRgb8(img)).unwrap()
+    }
+
+    fn sample_images() -> HashMap<usize, Vec<u8>> {
+        (0..13).map(|i| (i, synthetic_png(i as u32))).collect()
+    }
+
+    fn open_zip(data: &[u8]) -> zip::ZipArchive<Cursor<&[u8]>> {
+        zip::ZipArchive::new(Cursor::new(data)).unwrap()
+    }
+
+    /// `*-196.png` fixtures, sorted; empty when the fixture directory does not exist.
+    fn fixture_icons() -> Vec<PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.to_string_lossy().ends_with("-196.png") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(dir) = icon_dir() {
+            walk(&dir, &mut out);
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn zip_validity_only_looks_at_packet_start_bytes() {
+        let mut data = vec![1u8; 4000];
+        assert!(zip_is_valid(&data));
+
+        data[1017] = 0x00; // not a packet start
+        data[1016 + 5] = 0x7c;
+        assert!(zip_is_valid(&data));
+
+        data[1016] = 0x00;
+        assert!(!zip_is_valid(&data));
+        data[1016] = 1;
+
+        data[1016 + 1024] = 0x7c;
+        assert!(!zip_is_valid(&data));
+        data[1016 + 1024] = 1;
+
+        data[1016 + 2 * 1024] = 0x00; // 3064: the last packet start inside 4000 bytes
+        assert!(!zip_is_valid(&data));
+        assert!(zip_is_valid(&[0u8; 1016])); // nothing at or after the first checked offset
+    }
+
+    #[test]
+    fn build_zip_stores_icons_verbatim() {
+        let images = sample_images();
+        let data = build_zip(&images, 7, 0, true).unwrap();
+        let mut archive = open_zip(&data);
+
+        let mut icons = 0;
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).unwrap();
+            if let Some(rest) = file.name().strip_prefix("icons/") {
+                let idx: usize = rest.split('_').next().unwrap().parse().unwrap();
+                assert_eq!(file.compression(), zip::CompressionMethod::Stored);
+                let mut body = Vec::new();
+                file.read_to_end(&mut body).unwrap();
+                assert_eq!(body, images[&idx]);
+                icons += 1;
+            }
+        }
+        assert_eq!(icons, images.len());
+
+        let mut manifest = String::new();
+        archive.by_name("manifest.json").unwrap().read_to_string(&mut manifest).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(manifest["0_0"]["ViewParam"][0]["Icon"], "icons/0_7.png");
+        assert_eq!(manifest["3_2"], manifest["4_2"]);
+        assert_eq!(manifest["3_2"]["ViewParam"][0]["Icon"], ""); // no image for button 13
+    }
+
+    #[test]
+    fn build_zip_can_still_deflate_icons() {
+        let images = sample_images();
+        let data = build_zip(&images, 1, 0, false).unwrap();
+        let mut archive = open_zip(&data);
+        let name = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .find(|n| n.starts_with("icons/"))
+            .unwrap();
+        assert_eq!(archive.by_name(&name).unwrap().compression(), zip::CompressionMethod::Deflated);
+    }
+
+    #[test]
+    fn padding_is_stored_and_grows_the_zip_by_exactly_its_size() {
+        let images = sample_images();
+        let base = build_zip(&images, 1, 0, true).unwrap().len();
+        for pad in [1usize, 10, 999] {
+            let data = build_zip(&images, 1, pad, true).unwrap();
+            assert_eq!(data.len(), base + pad);
+            let mut archive = open_zip(&data);
+            let dummy = archive.by_name("dummy.txt").unwrap();
+            assert_eq!(dummy.compression(), zip::CompressionMethod::Stored);
+            assert_eq!(dummy.size() as usize, pad);
+        }
+    }
+
+    #[test]
+    fn stored_zip_overhead_is_small_and_deterministic() {
+        let images = sample_images();
+        let payload: usize = images.values().map(Vec::len).sum();
+        let a = build_zip(&images, 1, 0, true).unwrap().len();
+        let b = build_zip(&images, 1, 0, true).unwrap().len();
+        assert_eq!(a, b); // entry order is shuffled, size is not
+        assert!(a > payload && a - payload < 3 * 1024, "overhead {}", a - payload);
+    }
+
+    #[test]
+    fn build_valid_zip_passes_the_firmware_check() {
+        let images = sample_images();
+        for _ in 0..20 {
+            let (data, retries) = build_valid_zip(&images, true).unwrap();
+            assert!(zip_is_valid(&data));
+            assert!(retries < MAX_RETRIES);
+            open_zip(&data); // still a readable ZIP after padding
+        }
+    }
+
+    #[test]
+    fn best_png_is_not_larger_than_default() {
+        let fast = |img: &DynamicImage| {
+            let mut buf = Vec::new();
+            img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+            buf
+        };
+        let mut imgs = vec![image::load_from_memory(&synthetic_png(3)).unwrap()];
+        imgs.extend(fixture_icons().iter().take(5).map(|p| image::open(p).unwrap()));
+        for img in imgs {
+            let (old, new) = (fast(&img), encode_png(&img).unwrap());
+            assert!(new.len() <= old.len(), "best {} > default {}", new.len(), old.len());
+            // Lossless: identical pixels after a round trip.
+            assert_eq!(image::load_from_memory(&new).unwrap().to_rgba8(), img.to_rgba8());
+        }
+    }
+
+    // -- Benchmark (run: cargo test --release -- --ignored --nocapture bench_flush_building)
+
+    /// The pre-patch behaviour, kept verbatim for comparison: deflated entries, a random
+    /// alphanumeric dummy of 237*retries bytes, everything rebuilt on each retry.
+    fn legacy_build_valid_zip(images: &HashMap<usize, Vec<u8>>) -> (Vec<u8>, usize) {
+        use rand::{distr::Alphanumeric, RngExt};
+        let mut retries = 0;
+        loop {
+            let flush_id = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let mut zip = zip::ZipWriter::new(&mut cursor);
+                let deflated =
+                    FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
+                let dummy: String = rngs::ThreadRng::default()
+                    .sample_iter(&Alphanumeric)
+                    .take(237 * retries)
+                    .map(char::from)
+                    .collect();
+                zip.start_file("dummy.txt", deflated).unwrap();
+                zip.write_all(dummy.as_bytes()).unwrap();
+                let mut manifest = json!({});
+                let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
+                numbers.shuffle(&mut rngs::ThreadRng::default());
+                for i in numbers {
+                    let mut view_param = json!({ "Text": "" });
+                    if let Some(img) = images.get(&i) {
+                        let name = format!("icons/{}_{}.png", i, flush_id);
+                        zip.start_file(&name, deflated).unwrap();
+                        zip.write_all(img).unwrap();
+                        view_param["Icon"] = json!(name);
+                    } else {
+                        view_param["Icon"] = json!("");
+                    }
+                    manifest[format!("{}_{}", i % 5, i / 5)] = json!({ "State": 0, "ViewParam": [view_param] });
+                }
+                zip.start_file("manifest.json", deflated).unwrap();
+                zip.write_all(serde_json::to_string(&manifest).unwrap().as_bytes()).unwrap();
+                zip.start_file("sentinel.txt", deflated).unwrap();
+                zip.finish().unwrap();
+            }
+            let data = cursor.into_inner();
+            if zip_is_valid(&data) {
+                return (data, retries);
+            }
+            retries += 1;
+        }
+    }
+
+    /// Mimic the real pipeline for 13 icons: OpenDeck renders a 144px canvas, sends it as a
+    /// JPEG data URL (browser default quality 0.92), the plugin decodes, scales to 196 and
+    /// re-encodes. `fast_png` selects the pre-patch (image default) PNG encoder.
+    fn pipeline_images(fast_png: bool) -> HashMap<usize, Vec<u8>> {
+        let icons = fixture_icons();
+        (0..13)
+            .map(|i| {
+                let src = if icons.is_empty() {
+                    image::load_from_memory(&synthetic_png(i as u32)).unwrap()
+                } else {
+                    image::open(&icons[i % icons.len()]).unwrap()
+                };
+                let small = src.resize_exact(144, 144, image::imageops::FilterType::Triangle).to_rgb8();
+                let mut jpeg = Vec::new();
+                DynamicImage::ImageRgb8(small)
+                    .write_with_encoder(JpegEncoder::new_with_quality(&mut jpeg, 92))
+                    .unwrap();
+                let decoded = resize_square(&image::load_from_memory(&jpeg).unwrap(), 196);
+                let png = if fast_png {
+                    let mut buf = Vec::new();
+                    decoded.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+                    buf
+                } else {
+                    encode_png(&decoded).unwrap()
+                };
+                (i, png)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_flush_building() {
+        const RUNS: usize = 30;
+        let old_images = pipeline_images(true);
+        let new_images = pipeline_images(false);
+
+        let t = Instant::now();
+        let _ = pipeline_images(false);
+        println!("encode 13 icons (new PNG settings, incl. JPEG round trip): {:?}", t.elapsed());
+
+        let run = |label: &str, f: &dyn Fn() -> (Vec<u8>, usize)| {
+            let mut times = Vec::new();
+            let (mut size, mut retries) = (0usize, 0usize);
+            for _ in 0..RUNS {
+                let t = Instant::now();
+                let (data, r) = f();
+                times.push(t.elapsed());
+                size += data.len();
+                retries += r;
+            }
+            times.sort();
+            println!(
+                "{label}: median {:?}  max {:?}  avg size {} B  avg retries {:.1}",
+                times[RUNS / 2],
+                times[RUNS - 1],
+                size / RUNS,
+                retries as f64 / RUNS as f64
+            );
+        };
+        println!(
+            "PNG payload: before {} B, after {} B",
+            old_images.values().map(Vec::len).sum::<usize>(),
+            new_images.values().map(Vec::len).sum::<usize>()
+        );
+        run("before (deflate + random dummy, rebuild per retry)", &|| legacy_build_valid_zip(&old_images));
+        run("after  (stored + 1-byte padding steps)           ", &|| build_valid_zip(&new_images, true).unwrap());
     }
 }

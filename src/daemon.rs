@@ -2,9 +2,11 @@ use anyhow::Result;
 use async_hid::AsyncHidRead;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep_until};
 
 use crate::config::WINDOW_MODE_STATUS;
@@ -13,6 +15,7 @@ use crate::config::WINDOW_MODE_CLEAR;
 use crate::config::Config;
 use crate::device::{ButtonEvent, UlanziDevice};
 use crate::openaction_client::BridgeEvent;
+use crate::press_filter::PressFilter;
 use crate::system_monitor::SystemMonitor;
 
 #[derive(Debug, Clone)]
@@ -23,7 +26,7 @@ pub enum HardwareEvent {
 }
 
 pub struct UlanziDaemon {
-    devices: HashMap<String, UlanziDevice>,
+    devices: HashMap<String, Arc<UlanziDevice>>,
     config: Config,
     system_monitor: SystemMonitor,
     cpu_usage: u8,
@@ -38,6 +41,10 @@ pub struct UlanziDaemon {
     last_flush_time: Option<Instant>,
     debounce_delay: Duration,
     min_flush_interval: Duration,
+    // Upload currently running in the background (at most one at a time)
+    flush_task: Option<JoinHandle<()>>,
+    // Withholds OpenDeck's "pressed" frames, see press_filter.rs
+    press_filter: PressFilter,
     // Cycle command channel
     cycle_rx: mpsc::Receiver<()>,
 }
@@ -53,9 +60,9 @@ impl UlanziDaemon {
         let mut devices = HashMap::new();
 
         // Try to connect to the first available device
-        match UlanziDevice::connect().await {
+        match UlanziDevice::connect(config.zip_stored).await {
             Ok(device) => {
-                devices.insert(device.get_id().to_string(), device);
+                devices.insert(device.get_id().to_string(), Arc::new(device));
             }
             Err(e) => {
                 warn!("No devices found at startup: {}", e);
@@ -63,6 +70,7 @@ impl UlanziDaemon {
         }
 
         let system_monitor = SystemMonitor::new();
+        let press_filter = PressFilter::new(config.suppress_press_feedback);
 
         Ok(Self {
             devices,
@@ -79,15 +87,20 @@ impl UlanziDaemon {
             last_flush_time: None,
             debounce_delay: Duration::from_millis(50),
             min_flush_interval: Duration::from_millis(20),
+            flush_task: None,
+            press_filter,
             cycle_rx,
         })
     }
 
     pub async fn run(mut self) -> Result<()> {
-        info!("Ulanzi Daemon started (debounced flush)");
+        info!(
+            "Ulanzi Daemon started (debounced flush, suppress_press_feedback={}, zip_stored={})",
+            self.config.suppress_press_feedback, self.config.zip_stored
+        );
 
         // --- Initial device setup for all connected devices ---
-        for device in self.devices.values_mut() {
+        for device in self.devices.values() {
             // 1. Clear the screen (all 14 buttons empty)
             if let Err(e) = device.clear_all_images().await {
                 error!("Failed to clear buttons for {}: {}", device.get_id(), e);
@@ -224,7 +237,7 @@ impl UlanziDaemon {
                         std::future::pending::<()>().await;
                     }
                 }, if deadline.is_some() => {
-                    self.perform_flush().await;
+                    self.perform_flush();
                 }
 
                 // Keep‑alive: update small window with current stats
@@ -232,8 +245,9 @@ impl UlanziDaemon {
                     use chrono::Local;
                     let now = Local::now();
                     let time_str = now.format("%H:%M:%S").to_string();
+                    // try_*: never wait for the HID writer here, an upload may hold it.
                     for device in self.devices.values() {
-                        if let Err(e) = device.set_small_window_data(
+                        if let Err(e) = device.try_set_small_window_data(
                             self.config.display_mode,
                             self.cpu_usage,
                             self.mem_usage,
@@ -242,6 +256,16 @@ impl UlanziDaemon {
                         ).await {
                             debug!("Failed to send keep-alive to {}: {}", device.get_id(), e);
                         }
+                    }
+
+                    // Frames withheld during a press whose key was released without
+                    // a follow-up render are real updates after all.
+                    let due = self.press_filter.expire(Instant::now());
+                    if !due.is_empty() {
+                        for (device_id, index, image) in due {
+                            self.stage_image(&device_id, index, &image).await;
+                        }
+                        self.schedule_flush();
                     }
                 }
 
@@ -283,37 +307,88 @@ impl UlanziDaemon {
         self.flush_deadline = Some(deadline);
     }
 
-    /// Perform the actual flush (send all staged button images to the device).
-    /// Uses a timeout to avoid hanging, and logs errors without crashing.
-    async fn perform_flush(&mut self) {
+    /// Start the actual flush (send all staged button images to the device).
+    /// The upload runs in its own task so key events keep being forwarded meanwhile;
+    /// only one runs at a time so HID writes never interleave. Errors and a 2 second
+    /// timeout per device are logged without crashing.
+    fn perform_flush(&mut self) {
         self.flush_deadline = None;
 
-        // Wrap the flush operation in a timeout.
-        let flush_future = async {
-            for device in self.devices.values() {
-                if let Err(e) = device.flush().await {
-                    info!("Failed to flush device {}: {}", device.get_id(), e);
-                    // Continue with other devices (if any) – don't break.
+        if self.flush_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            // Previous upload still on the wire: look again shortly.
+            self.flush_deadline = Some(Instant::now() + Duration::from_millis(10));
+            return;
+        }
+
+        // With press suppression on, skip devices that already show the staged images.
+        let skip_clean = self.config.suppress_press_feedback;
+        let devices: Vec<Arc<UlanziDevice>> = self
+            .devices
+            .values()
+            .filter(|d| !skip_clean || d.needs_flush())
+            .cloned()
+            .collect();
+        self.last_flush_time = Some(Instant::now());
+        if devices.is_empty() {
+            debug!("Staged images match the device, skipping flush");
+            return;
+        }
+
+        self.flush_task = Some(tokio::spawn(async move {
+            for device in devices {
+                match tokio::time::timeout(Duration::from_secs(2), device.flush()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        // Continue with other devices (if any) – don't break.
+                        info!("Failed to flush device {}: {}", device.get_id(), e);
+                    }
+                    Err(_) => info!("Flush timed out after 2 seconds – device may be stuck"),
                 }
             }
-            self.last_flush_time = Some(Instant::now());
             debug!("Flush completed (or attempted)");
-        };
+        }));
+    }
 
-        match tokio::time::timeout(Duration::from_secs(2), flush_future).await {
-            Ok(_) => {
-                // Flush finished within timeout (success or logged error).
+    /// Device addressed by a plugin command, falling back to the first one.
+    fn resolve_device(&self, device_id: &str) -> Option<Arc<UlanziDevice>> {
+        self.devices
+            .get(device_id)
+            .or_else(|| self.devices.values().next())
+            .cloned()
+    }
+
+    /// Stage one image on a device (it is sent by the next flush).
+    async fn stage_image(&self, device_id: &str, index: usize, image: &str) {
+        let Some(dev) = self.devices.get(device_id) else {
+            warn!("SetImage: No target device found for {}", device_id);
+            return;
+        };
+        debug!("Setting image for button {} on {}", index, dev.get_id());
+        match dev.set_button_image(index, image).await {
+            Ok(true) => {
+                debug!(
+                    "SetImage: device={} position={} image_len={} (staged)",
+                    dev.get_id(),
+                    index,
+                    image.len()
+                );
             }
-            Err(_) => {
-                info!("Flush timed out after 2 seconds – device may be stuck");
-                // Still update last_flush_time to avoid immediate retry storms.
-                self.last_flush_time = Some(Instant::now());
+            Ok(false) => {
+                debug!("Image unchanged for button {}, skipping", index);
             }
+            Err(e) => error!("Failed to set image: {}", e),
         }
     }
 
     async fn handle_device_event(&mut self, device_id: &str, event: ButtonEvent) {
         debug!("Button event from {}: {:?}", device_id, event);
+        let now = Instant::now();
+        if event.pressed {
+            self.press_filter.key_down(device_id, event.index, now);
+        } else {
+            self.press_filter.key_up(device_id, event.index, now);
+        }
+        // Forward to OpenDeck first: nothing below may delay a key event.
         if let Some(ref tx) = self.hw_event_tx {
             let outbound = if event.pressed {
                 HardwareEvent::KeyDown {
@@ -339,42 +414,29 @@ impl UlanziDaemon {
                 position,
                 image_base64,
             } => {
-                let dev = if let Some(d) = self.devices.get_mut(&device_id) {
-                    Some(d)
-                } else {
-                    self.devices.values_mut().next()
-                };
-                if let Some(dev) = dev {
-                    let index = position as usize;
-                    debug!("Setting image for button {} on {}", index, dev.get_id());
-                    match dev.set_button_image(index, &image_base64).await {
-                        Ok(true) => {
-                            debug!(
-                                "SetImage: device={} position={} image_len={} (staged)",
-                                dev.get_id(),
-                                index,
-                                image_base64.len()
-                            );
-                        }
-                        Ok(false) => {
-                            debug!("Image unchanged for button {}, skipping", index);
-                        }
-                        Err(e) => error!("Failed to set image: {}", e),
-                    }
-                } else {
+                let Some(dev) = self.resolve_device(&device_id) else {
                     warn!("SetImage: No target device found for {}", device_id);
+                    return;
+                };
+                let index = position as usize;
+                let frames = self.press_filter.on_set_image(
+                    dev.get_id(),
+                    index,
+                    image_base64,
+                    Instant::now(),
+                );
+                if frames.is_empty() {
+                    debug!("SetImage for held button {} withheld", index);
+                }
+                for (device_id, index, image) in frames {
+                    self.stage_image(&device_id, index, &image).await;
                 }
             }
             BridgeEvent::ClearImage {
                 device_id,
                 position,
             } => {
-                let dev = if let Some(d) = self.devices.get_mut(&device_id) {
-                    Some(d)
-                } else {
-                    self.devices.values_mut().next()
-                };
-                if let Some(dev) = dev {
+                if let Some(dev) = self.resolve_device(&device_id) {
                     let index = position as usize;
                     debug!(
                         "ClearImage: device={} position={} (staged)",
@@ -382,6 +444,9 @@ impl UlanziDaemon {
                         index
                     );
                     dev.clear_button_image(index);
+                    for (device_id, index, image) in self.press_filter.on_clear(dev.get_id(), index) {
+                        self.stage_image(&device_id, index, &image).await;
+                    }
                 } else {
                     warn!("ClearImage: No target device found for {}", device_id);
                 }
@@ -470,6 +535,8 @@ mod tests {
             last_flush_time: None,
             debounce_delay: Duration::from_millis(50),
             min_flush_interval: Duration::from_millis(20),
+            flush_task: None,
+            press_filter: PressFilter::new(true),
             cycle_rx,
         };
 
@@ -513,6 +580,8 @@ mod tests {
             last_flush_time: None,
             debounce_delay: Duration::from_millis(50),
             min_flush_interval: Duration::from_millis(20),
+            flush_task: None,
+            press_filter: PressFilter::new(true),
             cycle_rx,
         };
 
@@ -531,5 +600,48 @@ mod tests {
             }
             _ => panic!("Expected KeyUp event"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_key_events_drive_press_filter() {
+        let (hw_event_tx, mut hw_event_rx) = mpsc::channel(4);
+        let (_device_input_tx, device_input_rx) = mpsc::channel(1);
+        let (device_input_tx_internal, _device_input_rx_internal) = mpsc::channel(1);
+        let (_cycle_tx, cycle_rx) = mpsc::channel(1);
+
+        let mut daemon = UlanziDaemon {
+            devices: HashMap::new(),
+            config: Config::default(),
+            system_monitor: SystemMonitor::new(),
+            cpu_usage: 0,
+            mem_usage: 0,
+            gpu_usage: 0,
+            plugin_cmd_rx: None,
+            hw_event_tx: Some(hw_event_tx),
+            device_input_rx,
+            device_input_tx: device_input_tx_internal,
+            flush_deadline: None,
+            last_flush_time: None,
+            debounce_delay: Duration::from_millis(50),
+            min_flush_interval: Duration::from_millis(20),
+            flush_task: None,
+            press_filter: PressFilter::new(true),
+            cycle_rx,
+        };
+
+        let down = ButtonEvent { index: 2, pressed: true, state: 1 };
+        let up = ButtonEvent { index: 2, pressed: false, state: 0 };
+
+        daemon.handle_device_event("dev", down).await;
+        assert!(matches!(hw_event_rx.recv().await, Some(HardwareEvent::KeyDown { .. })));
+        // Pressed frame is withheld while the key is down ...
+        let now = Instant::now();
+        assert!(daemon.press_filter.on_set_image("dev", 2, "shrunk".into(), now).is_empty());
+
+        daemon.handle_device_event("dev", up).await;
+        assert!(matches!(hw_event_rx.recv().await, Some(HardwareEvent::KeyUp { .. })));
+        // ... and the post-release render is staged normally.
+        let out = daemon.press_filter.on_set_image("dev", 2, "full".into(), now);
+        assert_eq!(out, vec![("dev".to_string(), 2, "full".to_string())]);
     }
 }

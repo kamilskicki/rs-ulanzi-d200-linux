@@ -1,3 +1,7 @@
 brightness: 100
 display_mode: 0 #INDOW_MODE_STATUS: u8 = 0
 
+
+# Latency options (both default to true; set to false for the original behaviour)
+suppress_press_feedback: true  # drop OpenDeck's shrunken "pressed" frame, skip no-op flushes
+zip_stored: true               # store PNGs uncompressed in the upload ZIP (they are already compressed)
