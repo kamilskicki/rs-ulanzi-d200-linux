@@ -1,11 +1,29 @@
-brightness: 100
-display_mode: 0 #INDOW_MODE_STATUS: u8 = 0
+# rs-ulanzi-d200-linux configuration.
+# Every key is optional; a missing file or key falls back to the value shown here.
 
+brightness: 100         # 0-100
+display_mode: 0         # status window: 0 = system stats, 1 = clock, 2 = blank (saved when cycled)
 
-# Latency options (both default to true; set to false for the original behaviour)
-suppress_press_feedback: true  # drop OpenDeck's shrunken "pressed" frame, skip no-op flushes
-zip_stored: true               # store PNGs uncompressed in the upload ZIP (they are already compressed)
+# --- Behaviour options (defaults are the recommended, tested values) ---------
 
-# Upload framing (fork patch 2026-11-14; code defaults are upstream-compatible: false / full)
-report_id_prefix: true         # prepend 0x00 report ID to every HID write (hidraw strips it; stops 0x00-start packets being sent short)
-boundary_check: magic_only     # full = retry on 0x00/0x7c packet start, magic_only = only on 7c 7c, off = never
+# Prepend a 0x00 report-ID byte to every HID write. hidraw treats the first byte
+# as the report ID and strips it when it is 0x00, so without the prefix a packet
+# whose first data byte is 0x00 reaches the device one byte short (this is the
+# root cause of the "offset 1016 + k*1024" corruption). Set to false only to
+# reproduce the original upstream behaviour.
+report_id_prefix: true
+
+# ZIP packet-boundary check applied before an upload.
+#   magic_only = retry only when a packet starts with the 7c 7c header magic
+#   full       = retry when a packet starts with 0x00 or 0x7c (upstream behaviour)
+#   off        = never retry
+boundary_check: magic_only
+
+# Drop OpenDeck's shrunken "pressed" frame and skip uploads that would not change
+# anything. Lowers latency but can swallow legitimate state-image updates (e.g.
+# Home Assistant toggles), so it is off by default.
+suppress_press_feedback: false
+
+# Store the (already compressed) PNG icons uncompressed in the upload ZIP.
+# Set to false to deflate them again (original behaviour, slower).
+zip_stored: true
