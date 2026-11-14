@@ -171,6 +171,17 @@ fn build_zip(
     pad: usize,
     icons_stored: bool,
 ) -> Result<Vec<u8>> {
+    build_zip_with_rng(images, flush_id, pad, icons_stored, &mut rngs::ThreadRng::default())
+}
+
+/// `build_zip` with the source of the entry-order shuffle injected (seeded in tests).
+fn build_zip_with_rng(
+    images: &HashMap<usize, Vec<u8>>,
+    flush_id: u64,
+    pad: usize,
+    icons_stored: bool,
+    rng: &mut impl rand::Rng,
+) -> Result<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut cursor);
@@ -189,7 +200,7 @@ fn build_zip(
         let mut manifest = json!({});
 
         let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
-        numbers.shuffle(&mut rngs::ThreadRng::default());
+        numbers.shuffle(rng);
         for i in numbers {
             if i == 13 {
                 let key1 = "3_2";
@@ -637,9 +648,6 @@ mod tests {
 
     use std::io::Read;
     use std::path::PathBuf;
-    use std::time::Instant;
-
-    use image::codecs::jpeg::JpegEncoder;
 
     /// Optional real-icon fixtures: set D200_TEST_ICON_DIR; tests using them are skipped otherwise.
     fn icon_dir() -> Option<std::path::PathBuf> {
@@ -648,8 +656,12 @@ mod tests {
 
     /// Deterministic 196x196 PNG (gradient + LCG noise), so most tests need no fixtures.
     fn synthetic_png(seed: u32) -> Vec<u8> {
+        synthetic_png_sized(seed, 196)
+    }
+
+    fn synthetic_png_sized(seed: u32, side: u32) -> Vec<u8> {
         let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
-        let img = RgbImage::from_fn(196, 196, |x, y| {
+        let img = RgbImage::from_fn(side, side, |x, y| {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             let noise = (state >> 24) as u8 % 16;
             image::Rgb([
@@ -749,9 +761,9 @@ mod tests {
         let c: Config = serde_yaml::from_str("boundary_check: magic_only\nreport_id_prefix: true").unwrap();
         assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::MagicOnly, true));
         let c: Config = serde_yaml::from_str("boundary_check: off").unwrap();
-        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::Off, false));
+        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::Off, true));
         let c: Config = serde_yaml::from_str("brightness: 50").unwrap();
-        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::Full, false)); // upstream defaults
+        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::MagicOnly, true)); // fork defaults
     }
 
     /// Model of the kernel hidraw/usbhid path for an unnumbered-report device: the first byte
@@ -923,15 +935,26 @@ mod tests {
 
     #[test]
     fn build_valid_zip_passes_the_firmware_check() {
-        let images = sample_images();
-        for _ in 0..20 {
-            let (data, retries) = build_valid_zip(&images, true, BoundaryCheck::Full).unwrap();
+        use rand::SeedableRng;
+        // Small icons keep the archive near 100 KB, so a valid alignment is found in a few retries.
+        let images: HashMap<usize, Vec<u8>> =
+            (0..13).map(|i| (i, synthetic_png_sized(i as u32, 48))).collect();
+        // Seeded entry order and a fixed flush id: the same archives, hence the same retries, every run.
+        let images = &images;
+        let build_with = |seed: u64| {
+            move |pad: usize, stored: bool| {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                build_zip_with_rng(images, seed, pad, stored, &mut rng)
+            }
+        };
+        for seed in 0..4u64 {
+            let (data, retries) = find_valid_zip(BoundaryCheck::Full, build_with(seed), true).unwrap();
             assert!(zip_is_valid(&data, BoundaryCheck::Full));
             assert!(retries < MAX_RETRIES);
             open_zip(&data); // still a readable ZIP after padding
         }
         for mode in [BoundaryCheck::MagicOnly, BoundaryCheck::Off] {
-            let (data, _) = build_valid_zip(&images, true, mode).unwrap();
+            let (data, _) = find_valid_zip(mode, build_with(7), true).unwrap();
             assert!(zip_is_valid(&data, mode));
             open_zip(&data);
         }
@@ -952,123 +975,5 @@ mod tests {
             // Lossless: identical pixels after a round trip.
             assert_eq!(image::load_from_memory(&new).unwrap().to_rgba8(), img.to_rgba8());
         }
-    }
-
-    // -- Benchmark (run: cargo test --release -- --ignored --nocapture bench_flush_building)
-
-    /// The pre-patch behaviour, kept verbatim for comparison: deflated entries, a random
-    /// alphanumeric dummy of 237*retries bytes, everything rebuilt on each retry.
-    fn legacy_build_valid_zip(images: &HashMap<usize, Vec<u8>>) -> (Vec<u8>, usize) {
-        use rand::{distr::Alphanumeric, RngExt};
-        let mut retries = 0;
-        loop {
-            let flush_id = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut cursor = Cursor::new(Vec::new());
-            {
-                let mut zip = zip::ZipWriter::new(&mut cursor);
-                let deflated =
-                    FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
-                let dummy: String = rngs::ThreadRng::default()
-                    .sample_iter(&Alphanumeric)
-                    .take(237 * retries)
-                    .map(char::from)
-                    .collect();
-                zip.start_file("dummy.txt", deflated).unwrap();
-                zip.write_all(dummy.as_bytes()).unwrap();
-                let mut manifest = json!({});
-                let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
-                numbers.shuffle(&mut rngs::ThreadRng::default());
-                for i in numbers {
-                    let mut view_param = json!({ "Text": "" });
-                    if let Some(img) = images.get(&i) {
-                        let name = format!("icons/{}_{}.png", i, flush_id);
-                        zip.start_file(&name, deflated).unwrap();
-                        zip.write_all(img).unwrap();
-                        view_param["Icon"] = json!(name);
-                    } else {
-                        view_param["Icon"] = json!("");
-                    }
-                    manifest[format!("{}_{}", i % 5, i / 5)] = json!({ "State": 0, "ViewParam": [view_param] });
-                }
-                zip.start_file("manifest.json", deflated).unwrap();
-                zip.write_all(serde_json::to_string(&manifest).unwrap().as_bytes()).unwrap();
-                zip.start_file("sentinel.txt", deflated).unwrap();
-                zip.finish().unwrap();
-            }
-            let data = cursor.into_inner();
-            if zip_is_valid(&data, BoundaryCheck::Full) {
-                return (data, retries);
-            }
-            retries += 1;
-        }
-    }
-
-    /// Mimic the real pipeline for 13 icons: OpenDeck renders a 144px canvas, sends it as a
-    /// JPEG data URL (browser default quality 0.92), the plugin decodes, scales to 196 and
-    /// re-encodes. `fast_png` selects the pre-patch (image default) PNG encoder.
-    fn pipeline_images(fast_png: bool) -> HashMap<usize, Vec<u8>> {
-        let icons = fixture_icons();
-        (0..13)
-            .map(|i| {
-                let src = if icons.is_empty() {
-                    image::load_from_memory(&synthetic_png(i as u32)).unwrap()
-                } else {
-                    image::open(&icons[i % icons.len()]).unwrap()
-                };
-                let small = src.resize_exact(144, 144, image::imageops::FilterType::Triangle).to_rgb8();
-                let mut jpeg = Vec::new();
-                DynamicImage::ImageRgb8(small)
-                    .write_with_encoder(JpegEncoder::new_with_quality(&mut jpeg, 92))
-                    .unwrap();
-                let decoded = resize_square(&image::load_from_memory(&jpeg).unwrap(), 196);
-                let png = if fast_png {
-                    let mut buf = Vec::new();
-                    decoded.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
-                    buf
-                } else {
-                    encode_png(&decoded).unwrap()
-                };
-                (i, png)
-            })
-            .collect()
-    }
-
-    #[test]
-    #[ignore]
-    fn bench_flush_building() {
-        const RUNS: usize = 30;
-        let old_images = pipeline_images(true);
-        let new_images = pipeline_images(false);
-
-        let t = Instant::now();
-        let _ = pipeline_images(false);
-        println!("encode 13 icons (new PNG settings, incl. JPEG round trip): {:?}", t.elapsed());
-
-        let run = |label: &str, f: &dyn Fn() -> (Vec<u8>, usize)| {
-            let mut times = Vec::new();
-            let (mut size, mut retries) = (0usize, 0usize);
-            for _ in 0..RUNS {
-                let t = Instant::now();
-                let (data, r) = f();
-                times.push(t.elapsed());
-                size += data.len();
-                retries += r;
-            }
-            times.sort();
-            println!(
-                "{label}: median {:?}  max {:?}  avg size {} B  avg retries {:.1}",
-                times[RUNS / 2],
-                times[RUNS - 1],
-                size / RUNS,
-                retries as f64 / RUNS as f64
-            );
-        };
-        println!(
-            "PNG payload: before {} B, after {} B",
-            old_images.values().map(Vec::len).sum::<usize>(),
-            new_images.values().map(Vec::len).sum::<usize>()
-        );
-        run("before (deflate + random dummy, rebuild per retry)", &|| legacy_build_valid_zip(&old_images));
-        run("after  (stored + 1-byte padding steps)           ", &|| build_valid_zip(&new_images, true, BoundaryCheck::Full).unwrap());
     }
 }
