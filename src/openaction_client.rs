@@ -1,10 +1,10 @@
 use log::info;
+use openaction::OpenActionResult;
 use openaction::async_trait;
 use openaction::global_events::{
-    set_global_event_handler, DeviceDidConnectEvent, DeviceDidDisconnectEvent, GlobalEventHandler,
-    SetBrightnessEvent, SetImageEvent,
+    DeviceDidConnectEvent, DeviceDidDisconnectEvent, GlobalEventHandler, SetBrightnessEvent,
+    SetImageEvent, set_global_event_handler,
 };
-use openaction::OpenActionResult;
 use tokio::sync::mpsc;
 
 #[derive(Debug)]

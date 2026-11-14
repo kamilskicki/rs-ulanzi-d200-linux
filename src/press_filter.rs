@@ -91,7 +91,13 @@ impl PressFilter {
         };
 
         if held && !burst {
-            self.withheld.insert(key, Withheld { image, released_at: None });
+            self.withheld.insert(
+                key,
+                Withheld {
+                    image,
+                    released_at: None,
+                },
+            );
         } else {
             // Either a normal frame, or the post-release render that supersedes
             // whatever was withheld for this key.
@@ -116,7 +122,9 @@ impl PressFilter {
         let due: Vec<KeyId> = self
             .withheld
             .iter()
-            .filter(|(_, w)| matches!(w.released_at, Some(t) if now.duration_since(t) >= RELEASE_GRACE))
+            .filter(
+                |(_, w)| matches!(w.released_at, Some(t) if now.duration_since(t) >= RELEASE_GRACE),
+            )
             .map(|(k, _)| k.clone())
             .collect();
         due.into_iter()
@@ -213,7 +221,10 @@ mod tests {
         assert!(f.on_set_image(DEV, 2, "x".into(), t0).is_empty());
         assert_eq!(frames(&f.on_clear(DEV, 7)), vec![(2, "x")]);
 
-        assert!(f.on_set_image(DEV, 2, "y".into(), t0 + Duration::from_secs(1)).is_empty());
+        assert!(
+            f.on_set_image(DEV, 2, "y".into(), t0 + Duration::from_secs(1))
+                .is_empty()
+        );
         assert!(f.on_clear(DEV, 2).is_empty());
         f.key_up(DEV, 2, t0 + Duration::from_secs(2));
         assert!(f.expire(t0 + Duration::from_secs(9)).is_empty());
@@ -234,7 +245,11 @@ mod tests {
         let t0 = Instant::now();
         f.key_down(DEV, 3, t0);
         assert_eq!(f.on_set_image("other", 3, "a".into(), t0).len(), 1);
-        assert_eq!(f.on_set_image(DEV, 4, "b".into(), t0 + Duration::from_secs(1)).len(), 1);
+        assert_eq!(
+            f.on_set_image(DEV, 4, "b".into(), t0 + Duration::from_secs(1))
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -242,7 +257,10 @@ mod tests {
         let mut f = PressFilter::new(false);
         let t0 = Instant::now();
         f.key_down(DEV, 3, t0);
-        assert_eq!(frames(&f.on_set_image(DEV, 3, "a".into(), t0)), vec![(3, "a")]);
+        assert_eq!(
+            frames(&f.on_set_image(DEV, 3, "a".into(), t0)),
+            vec![(3, "a")]
+        );
         assert!(f.on_clear(DEV, 3).is_empty());
         assert!(f.expire(t0 + Duration::from_secs(1)).is_empty());
     }

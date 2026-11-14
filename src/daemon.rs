@@ -9,10 +9,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep_until};
 
-use crate::config::WINDOW_MODE_STATUS;
-use crate::config::WINDOW_MODE_CLOCK;
-use crate::config::WINDOW_MODE_CLEAR;
 use crate::config::Config;
+use crate::config::WINDOW_MODE_CLEAR;
+use crate::config::WINDOW_MODE_CLOCK;
+use crate::config::WINDOW_MODE_STATUS;
 use crate::device::{ButtonEvent, DeviceOptions, UlanziDevice};
 use crate::openaction_client::BridgeEvent;
 use crate::press_filter::PressFilter;
@@ -140,10 +140,10 @@ impl UlanziDaemon {
                     loop {
                         match reader.read_input_report(&mut buf).await {
                             Ok(len) if len > 0 => {
-                                if let Some(event) = UlanziDevice::parse_report(&buf[..len]) {
-                                    if tx.send((device_id.clone(), event)).await.is_err() {
-                                        break;
-                                    }
+                                if let Some(event) = UlanziDevice::parse_report(&buf[..len])
+                                    && tx.send((device_id.clone(), event)).await.is_err()
+                                {
+                                    break;
                                 }
                             }
                             Ok(_) => continue,
@@ -437,7 +437,8 @@ impl UlanziDaemon {
                         index
                     );
                     dev.clear_button_image(index);
-                    for (device_id, index, image) in self.press_filter.on_clear(dev.get_id(), index) {
+                    for (device_id, index, image) in self.press_filter.on_clear(dev.get_id(), index)
+                    {
                         self.stage_image(&device_id, index, &image).await;
                     }
                 } else {
@@ -468,7 +469,7 @@ impl UlanziDaemon {
         let current = self.config.display_mode;
         let new_mode = match current {
             WINDOW_MODE_STATUS => WINDOW_MODE_CLOCK, // Status -> Clock
-            WINDOW_MODE_CLOCK => WINDOW_MODE_CLEAR, // Clock -> Clear
+            WINDOW_MODE_CLOCK => WINDOW_MODE_CLEAR,  // Clock -> Clear
             WINDOW_MODE_CLEAR => WINDOW_MODE_STATUS, // Clear -> Status
             _ => WINDOW_MODE_STATUS,
         };
@@ -479,7 +480,7 @@ impl UlanziDaemon {
         info!("Small‑window mode cycled: {:?} -> {:?}", current, new_mode);
 
         // Convert to u8 for device command
-        let mode_byte = new_mode as u8;
+        let mode_byte = new_mode;
         let now = chrono::Local::now();
         let time_str = now.format("%H:%M:%S").to_string();
         for device in self.devices.values() {
@@ -541,7 +542,10 @@ mod tests {
 
         let received = hw_event_rx.recv().await.unwrap();
         match received {
-            HardwareEvent::KeyDown { device_id, key_index } => {
+            HardwareEvent::KeyDown {
+                device_id,
+                key_index,
+            } => {
                 assert_eq!(device_id, "test_device");
                 assert_eq!(key_index, 5);
             }
@@ -586,7 +590,10 @@ mod tests {
 
         let received = hw_event_rx.recv().await.unwrap();
         match received {
-            HardwareEvent::KeyUp { device_id, key_index } => {
+            HardwareEvent::KeyUp {
+                device_id,
+                key_index,
+            } => {
                 assert_eq!(device_id, "test_device");
                 assert_eq!(key_index, 3);
             }
@@ -621,19 +628,40 @@ mod tests {
             cycle_rx,
         };
 
-        let down = ButtonEvent { index: 2, pressed: true, state: 1 };
-        let up = ButtonEvent { index: 2, pressed: false, state: 0 };
+        let down = ButtonEvent {
+            index: 2,
+            pressed: true,
+            state: 1,
+        };
+        let up = ButtonEvent {
+            index: 2,
+            pressed: false,
+            state: 0,
+        };
 
         daemon.handle_device_event("dev", down).await;
-        assert!(matches!(hw_event_rx.recv().await, Some(HardwareEvent::KeyDown { .. })));
+        assert!(matches!(
+            hw_event_rx.recv().await,
+            Some(HardwareEvent::KeyDown { .. })
+        ));
         // Pressed frame is withheld while the key is down ...
         let now = Instant::now();
-        assert!(daemon.press_filter.on_set_image("dev", 2, "shrunk".into(), now).is_empty());
+        assert!(
+            daemon
+                .press_filter
+                .on_set_image("dev", 2, "shrunk".into(), now)
+                .is_empty()
+        );
 
         daemon.handle_device_event("dev", up).await;
-        assert!(matches!(hw_event_rx.recv().await, Some(HardwareEvent::KeyUp { .. })));
+        assert!(matches!(
+            hw_event_rx.recv().await,
+            Some(HardwareEvent::KeyUp { .. })
+        ));
         // ... and the post-release render is staged normally.
-        let out = daemon.press_filter.on_set_image("dev", 2, "full".into(), now);
+        let out = daemon
+            .press_filter
+            .on_set_image("dev", 2, "full".into(), now);
         assert_eq!(out, vec![("dev".to_string(), 2, "full".to_string())]);
     }
 }

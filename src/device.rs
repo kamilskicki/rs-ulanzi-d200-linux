@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_hid::{AsyncHidWrite, DeviceReader, DeviceWriter, HidBackend};
 use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
 use data_url::DataUrl;
@@ -133,7 +133,10 @@ fn resize_square(img: &DynamicImage, size: u32) -> DynamicImage {
     // Determine if the source had alpha (RGBA8, LA8, etc.)
     let has_alpha = matches!(
         img.color(),
-        image::ColorType::Rgba8 | image::ColorType::La8 | image::ColorType::Rgba16 | image::ColorType::La16
+        image::ColorType::Rgba8
+            | image::ColorType::La8
+            | image::ColorType::Rgba16
+            | image::ColorType::La16
     );
 
     let x = ((size - new_w) / 2) as i64;
@@ -157,7 +160,8 @@ fn resize_square(img: &DynamicImage, size: u32) -> DynamicImage {
 /// (the `image` default is the fast, weak fdeflate mode) to shrink every later upload.
 fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Default, PngFilter::Adaptive);
+    let encoder =
+        PngEncoder::new_with_quality(&mut buf, CompressionType::Default, PngFilter::Adaptive);
     img.write_with_encoder(encoder)?;
     Ok(buf)
 }
@@ -171,7 +175,13 @@ fn build_zip(
     pad: usize,
     icons_stored: bool,
 ) -> Result<Vec<u8>> {
-    build_zip_with_rng(images, flush_id, pad, icons_stored, &mut rngs::ThreadRng::default())
+    build_zip_with_rng(
+        images,
+        flush_id,
+        pad,
+        icons_stored,
+        &mut rngs::ThreadRng::default(),
+    )
 }
 
 /// `build_zip` with the source of the entry-order shuffle injected (seeded in tests).
@@ -334,7 +344,11 @@ fn build_valid_zip(
     mode: BoundaryCheck,
 ) -> Result<(Vec<u8>, usize)> {
     let flush_id = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    find_valid_zip(mode, |pad, stored| build_zip(images, flush_id, pad, stored), icons_stored)
+    find_valid_zip(
+        mode,
+        |pad, stored| build_zip(images, flush_id, pad, stored),
+        icons_stored,
+    )
 }
 
 /// The retry loop of `build_valid_zip`, with the archive builder injected.
@@ -368,9 +382,7 @@ impl UlanziDevice {
         let device_info = devices
             .into_iter()
             .find(|d| {
-                d.vendor_id == VENDOR_ID
-                    && d.product_id == PRODUCT_ID
-                    && d.usage_page == USAGE_PAGE
+                d.vendor_id == VENDOR_ID && d.product_id == PRODUCT_ID && d.usage_page == USAGE_PAGE
             })
             .ok_or_else(|| anyhow!("Ulanzi D200 device not found"))?;
 
@@ -503,8 +515,6 @@ impl UlanziDevice {
         Ok(())
     }
 
-
-
     /// Stage a button image from a data URL (Base64) or a file path.
     /// Returns `Ok(true)` if the image was new/different, `Ok(false)` if unchanged.
     /// Call `flush()` to apply all staged images.
@@ -578,10 +588,14 @@ impl UlanziDevice {
         let started = std::time::Instant::now();
         let (zip_data, retries) = {
             let images = images_snapshot.clone();
-            tokio::task::spawn_blocking(move || build_valid_zip(&images, icons_stored, mode)).await??
+            tokio::task::spawn_blocking(move || build_valid_zip(&images, icons_stored, mode))
+                .await??
         };
         let build_ms = started.elapsed().as_millis();
-        debug!("ZIP archive passed the boundary check ({} retries)", retries);
+        debug!(
+            "ZIP archive passed the boundary check ({} retries)",
+            retries
+        );
 
         let sent = std::time::Instant::now();
         self.send_file(&zip_data).await?;
@@ -608,7 +622,11 @@ impl UlanziDevice {
         }
         let packet = self.build_packet(command, payload, payload.len() as u32);
         let framed = frame_report(&packet, self.report_id_prefix);
-        self.writer.lock().await.write_output_report(&framed).await?;
+        self.writer
+            .lock()
+            .await
+            .write_output_report(&framed)
+            .await?;
         Ok(())
     }
 
@@ -684,7 +702,9 @@ mod tests {
     /// `*-196.png` fixtures, sorted; empty when the fixture directory does not exist.
     fn fixture_icons() -> Vec<PathBuf> {
         fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -727,7 +747,11 @@ mod tests {
 
     #[test]
     fn boundary_check_modes() {
-        let (full, magic, off) = (BoundaryCheck::Full, BoundaryCheck::MagicOnly, BoundaryCheck::Off);
+        let (full, magic, off) = (
+            BoundaryCheck::Full,
+            BoundaryCheck::MagicOnly,
+            BoundaryCheck::Off,
+        );
         let at = |bytes: &[u8], offset: usize| {
             let mut d = vec![1u8; 4000];
             d[offset..offset + bytes.len()].copy_from_slice(bytes);
@@ -758,18 +782,32 @@ mod tests {
 
     #[test]
     fn boundary_check_config_names() {
-        let c: Config = serde_yaml::from_str("boundary_check: magic_only\nreport_id_prefix: true").unwrap();
-        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::MagicOnly, true));
+        let c: Config =
+            serde_yaml::from_str("boundary_check: magic_only\nreport_id_prefix: true").unwrap();
+        assert_eq!(
+            (c.boundary_check, c.report_id_prefix),
+            (BoundaryCheck::MagicOnly, true)
+        );
         let c: Config = serde_yaml::from_str("boundary_check: off").unwrap();
-        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::Off, true));
+        assert_eq!(
+            (c.boundary_check, c.report_id_prefix),
+            (BoundaryCheck::Off, true)
+        );
         let c: Config = serde_yaml::from_str("brightness: 50").unwrap();
-        assert_eq!((c.boundary_check, c.report_id_prefix), (BoundaryCheck::MagicOnly, true)); // fork defaults
+        assert_eq!(
+            (c.boundary_check, c.report_id_prefix),
+            (BoundaryCheck::MagicOnly, true)
+        ); // fork defaults
     }
 
     /// Model of the kernel hidraw/usbhid path for an unnumbered-report device: the first byte
     /// is the report ID and a 0x00 is dropped, everything else goes on the wire as written.
     fn wire_bytes(write_buf: &[u8]) -> &[u8] {
-        if write_buf[0] == 0x00 { &write_buf[1..] } else { write_buf }
+        if write_buf[0] == 0x00 {
+            &write_buf[1..]
+        } else {
+            write_buf
+        }
     }
 
     #[test]
@@ -779,14 +817,19 @@ mod tests {
         assert_eq!(packets.len(), 3); // 1016 + 1024 + 960
         assert!(packets.iter().all(|p| p.len() == PACKET_SIZE));
         assert_eq!(packets[0][..2], HEADER);
-        assert_eq!(&packets[0][2..4], &(CommandProtocol::OutSetButtons as u16).to_be_bytes());
+        assert_eq!(
+            &packets[0][2..4],
+            &(CommandProtocol::OutSetButtons as u16).to_be_bytes()
+        );
         assert_eq!(&packets[0][4..8], &3000u32.to_le_bytes());
         assert_eq!(&packets[0][8..], &data[..1016]);
         // continuation packets start exactly at the checked offsets 1016 + k*1024
         assert_eq!(packets[1][0], data[1016]);
         assert_eq!(packets[2][0], data[1016 + 1024]);
         let mut joined = packets[0][8..].to_vec();
-        packets[1..].iter().for_each(|p| joined.extend_from_slice(p));
+        packets[1..]
+            .iter()
+            .for_each(|p| joined.extend_from_slice(p));
         assert_eq!(&joined[..3000], &data[..]);
         assert!(joined[3000..].iter().all(|&b| b == 0)); // zero padding
         // small payload: one packet
@@ -815,9 +858,18 @@ mod tests {
             assert_eq!(wire_bytes(&framed), &p[..]);
         }
         // without the prefix, a packet starting with 0x00 is truncated by one byte (the hypothesis)
-        assert_eq!(wire_bytes(&frame_report(&packets[1], false)).len(), PACKET_SIZE - 1);
-        assert_eq!(wire_bytes(&frame_report(&packets[0], false)).len(), PACKET_SIZE);
-        assert_eq!(wire_bytes(&frame_report(&packets[2], false)).len(), PACKET_SIZE);
+        assert_eq!(
+            wire_bytes(&frame_report(&packets[1], false)).len(),
+            PACKET_SIZE - 1
+        );
+        assert_eq!(
+            wire_bytes(&frame_report(&packets[0], false)).len(),
+            PACKET_SIZE
+        );
+        assert_eq!(
+            wire_bytes(&frame_report(&packets[2], false)).len(),
+            PACKET_SIZE
+        );
     }
 
     #[test]
@@ -838,7 +890,10 @@ mod tests {
         let (zip, retries) = find_valid_zip(BoundaryCheck::MagicOnly, build, true).unwrap();
         assert_eq!(retries, 0); // magic_only: accepted at once
         assert_eq!(zip[FIRST_BOUNDARY], 0x00);
-        assert_eq!(find_valid_zip(BoundaryCheck::Off, build, true).unwrap().1, 0);
+        assert_eq!(
+            find_valid_zip(BoundaryCheck::Off, build, true).unwrap().1,
+            0
+        );
 
         // 7c 7c at a boundary still forces a retry in magic_only
         let build_magic = |pad: usize, _stored: bool| -> Result<Vec<u8>> {
@@ -849,7 +904,12 @@ mod tests {
             }
             Ok(d)
         };
-        assert_eq!(find_valid_zip(BoundaryCheck::MagicOnly, build_magic, true).unwrap().1, 3);
+        assert_eq!(
+            find_valid_zip(BoundaryCheck::MagicOnly, build_magic, true)
+                .unwrap()
+                .1,
+            3
+        );
     }
 
     #[test]
@@ -890,7 +950,11 @@ mod tests {
         assert_eq!(icons, images.len());
 
         let mut manifest = String::new();
-        archive.by_name("manifest.json").unwrap().read_to_string(&mut manifest).unwrap();
+        archive
+            .by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
         assert_eq!(manifest["0_0"]["ViewParam"][0]["Icon"], "icons/0_7.png");
         assert_eq!(manifest["3_2"], manifest["4_2"]);
@@ -906,7 +970,10 @@ mod tests {
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .find(|n| n.starts_with("icons/"))
             .unwrap();
-        assert_eq!(archive.by_name(&name).unwrap().compression(), zip::CompressionMethod::Deflated);
+        assert_eq!(
+            archive.by_name(&name).unwrap().compression(),
+            zip::CompressionMethod::Deflated
+        );
     }
 
     #[test]
@@ -930,15 +997,20 @@ mod tests {
         let a = build_zip(&images, 1, 0, true).unwrap().len();
         let b = build_zip(&images, 1, 0, true).unwrap().len();
         assert_eq!(a, b); // entry order is shuffled, size is not
-        assert!(a > payload && a - payload < 3 * 1024, "overhead {}", a - payload);
+        assert!(
+            a > payload && a - payload < 3 * 1024,
+            "overhead {}",
+            a - payload
+        );
     }
 
     #[test]
     fn build_valid_zip_passes_the_firmware_check() {
         use rand::SeedableRng;
         // Small icons keep the archive near 100 KB, so a valid alignment is found in a few retries.
-        let images: HashMap<usize, Vec<u8>> =
-            (0..13).map(|i| (i, synthetic_png_sized(i as u32, 48))).collect();
+        let images: HashMap<usize, Vec<u8>> = (0..13)
+            .map(|i| (i, synthetic_png_sized(i as u32, 48)))
+            .collect();
         // Seeded entry order and a fixed flush id: the same archives, hence the same retries, every run.
         let images = &images;
         let build_with = |seed: u64| {
@@ -948,7 +1020,8 @@ mod tests {
             }
         };
         for seed in 0..4u64 {
-            let (data, retries) = find_valid_zip(BoundaryCheck::Full, build_with(seed), true).unwrap();
+            let (data, retries) =
+                find_valid_zip(BoundaryCheck::Full, build_with(seed), true).unwrap();
             assert!(zip_is_valid(&data, BoundaryCheck::Full));
             assert!(retries < MAX_RETRIES);
             open_zip(&data); // still a readable ZIP after padding
@@ -964,16 +1037,30 @@ mod tests {
     fn best_png_is_not_larger_than_default() {
         let fast = |img: &DynamicImage| {
             let mut buf = Vec::new();
-            img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+            img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
             buf
         };
         let mut imgs = vec![image::load_from_memory(&synthetic_png(3)).unwrap()];
-        imgs.extend(fixture_icons().iter().take(5).map(|p| image::open(p).unwrap()));
+        imgs.extend(
+            fixture_icons()
+                .iter()
+                .take(5)
+                .map(|p| image::open(p).unwrap()),
+        );
         for img in imgs {
             let (old, new) = (fast(&img), encode_png(&img).unwrap());
-            assert!(new.len() <= old.len(), "best {} > default {}", new.len(), old.len());
+            assert!(
+                new.len() <= old.len(),
+                "best {} > default {}",
+                new.len(),
+                old.len()
+            );
             // Lossless: identical pixels after a round trip.
-            assert_eq!(image::load_from_memory(&new).unwrap().to_rgba8(), img.to_rgba8());
+            assert_eq!(
+                image::load_from_memory(&new).unwrap().to_rgba8(),
+                img.to_rgba8()
+            );
         }
     }
 }

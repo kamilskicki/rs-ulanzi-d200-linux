@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-
 pub const WINDOW_MODE_STATUS: u8 = 0;
 pub const WINDOW_MODE_CLOCK: u8 = 1;
 pub const WINDOW_MODE_CLEAR: u8 = 2;
@@ -98,8 +97,8 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         if let Some(ref path) = self.filepath {
-            let content = serde_yaml::to_string(self)
-                .with_context(|| "Failed to serialize config")?;
+            let content =
+                serde_yaml::to_string(self).with_context(|| "Failed to serialize config")?;
             fs::write(path, content)
                 .with_context(|| format!("Failed to write config file: {:?}", path))?;
         }

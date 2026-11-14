@@ -1,16 +1,16 @@
+mod action;
 mod config;
 mod daemon;
 mod device;
 mod openaction_client;
 mod press_filter;
 mod system_monitor;
-mod action;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
 use log::{error, info, warn};
-use std::path::PathBuf;
 use openaction::*;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
@@ -61,7 +61,9 @@ async fn main() -> Result<()> {
 
     // The driver only runs as an OpenDeck plugin (OpenDeck passes -pluginUUID etc.).
     let Some(uuid) = args.plugin_uuid.clone() else {
-        bail!("This driver is started by OpenDeck (missing -pluginUUID); it is not a standalone program");
+        bail!(
+            "This driver is started by OpenDeck (missing -pluginUUID); it is not a standalone program"
+        );
     };
 
     // 1. Load configuration; a missing or invalid file falls back to the built-in defaults.
@@ -119,7 +121,9 @@ async fn main() -> Result<()> {
         });
 
         // Register the action with the cycle sender
-        let cycle_action = action::CycleStatusWindow { cycle_tx: cycle_tx.clone() };
+        let cycle_action = action::CycleStatusWindow {
+            cycle_tx: cycle_tx.clone(),
+        };
         register_action(cycle_action).await;
 
         // Outbound events forwarder (unchanged)
