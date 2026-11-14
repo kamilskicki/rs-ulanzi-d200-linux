@@ -9,8 +9,9 @@ CONFIG_YAML="config.yaml"
 PLUGIN_FOLDER="com.glmagalhaes.ulanzi.d200.sdPlugin"
 
 # ---------- Usage ----------
+# Optional: OUT_ZIP=<name>.zip overrides the archive name.
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 {debug|release}"
+    echo "Usage: [OUT_ZIP=name.zip] $0 {debug|release}"
     exit 1
 fi
 
@@ -27,6 +28,8 @@ else
     echo "Invalid mode: $MODE (use 'debug' or 'release')"
     exit 1
 fi
+
+ZIP_NAME="${OUT_ZIP:-$ZIP_NAME}"
 
 # ---------- Build ----------
 if [ "$MODE" = "debug" ]; then
@@ -54,14 +57,14 @@ if [ ! -d "$ASSETS_SRC" ]; then
 fi
 
 if [ ! -f "$CONFIG_YAML" ]; then
-    echo "Error: $CONFIG_YAML directory not found"
+    echo "Error: $CONFIG_YAML not found"
     exit 1
 fi
 
 
 # ---------- Create temporary packaging directory ----------
 TMP_DIR=$(mktemp -d)
-trap "rm -rf $TMP_DIR" EXIT  # clean up on exit
+trap 'rm -rf "$TMP_DIR"' EXIT  # clean up on exit
 
 # ---------- Create the required parent folder ----------
 mkdir -p "$TMP_DIR/$PLUGIN_FOLDER"
@@ -73,10 +76,9 @@ cp "$CONFIG_YAML" "$TMP_DIR/$PLUGIN_FOLDER/"
 cp -r "$ASSETS_SRC" "$TMP_DIR/$PLUGIN_FOLDER/"
 
 # ---------- Create zip ----------
-rm -f "$ZIP_NAME"
-cd "$TMP_DIR"
-zip -r "$OLDPWD/$ZIP_NAME" "$PLUGIN_FOLDER" > /dev/null
-cd - > /dev/null
+ROOT_DIR="$PWD"
+rm -f "$ROOT_DIR/$ZIP_NAME"
+(cd "$TMP_DIR" && zip -r "$ROOT_DIR/$ZIP_NAME" "$PLUGIN_FOLDER" > /dev/null)
 
 echo "Successfully created $ZIP_NAME"
 echo "Zip contains the top-level folder: $PLUGIN_FOLDER/"

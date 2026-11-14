@@ -13,3 +13,7 @@
 ### Debug Files ###
 rs-ulanzi-d200-*.zip
 com.glmagalhaes.ulanzi.d200.zip
+# CI / release artefacts
+plugin-ci.zip
+SHA256SUMS
+com.glmagalhaes.ulanzi.d200-*.zip
