@@ -183,21 +183,11 @@ impl UlanziDaemon {
             interval(Duration::from_millis(self.config.stats_interval_ms));
 
         let shutdown = async {
-            #[cfg(unix)]
-            {
-                let mut sigint =
-                    signal::unix::signal(signal::unix::SignalKind::interrupt()).unwrap();
-                let mut sigterm =
-                    signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
-                tokio::select! {
-                    _ = sigint.recv() => info!("Received SIGINT, shutting down..."),
-                    _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
-                }
-            }
-            #[cfg(windows)]
-            {
-                let _ = signal::ctrl_c().await;
-                info!("Received Ctrl-C, shutting down...");
+            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt()).unwrap();
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+            tokio::select! {
+                _ = sigint.recv() => info!("Received SIGINT, shutting down..."),
+                _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
             }
         };
         tokio::pin!(shutdown);
@@ -471,7 +461,6 @@ impl UlanziDaemon {
                     warn!("SetBrightness: No target device found for {}", device_id);
                 }
             }
-            BridgeEvent::DeviceConnected(_) | BridgeEvent::DeviceDisconnected(_) => {}
         }
     }
 

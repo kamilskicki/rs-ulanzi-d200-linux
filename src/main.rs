@@ -6,7 +6,7 @@ mod press_filter;
 mod system_monitor;
 mod action;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use log::{error, info, warn};
 use std::path::PathBuf;
@@ -23,14 +23,6 @@ struct Args {
     /// Log level (info, debug, trace)
     #[arg(short, long, default_value = "info")]
     log_level: String,
-
-    /// Run as a daemon
-    #[arg(short, long)]
-    daemon: bool,
-
-    /// Enable WebSocket server for plugin communication
-    #[arg(long)]
-    websocket: bool,
 
     /// WebSocket server port
     #[arg(long, short = 'p', default_value_t = 57116)]
@@ -65,32 +57,31 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&args.log_level))
         .init();
 
-    info!("Starting Ulanzi D200 Rust Driver (MQ-RUST-002)");
+    info!("Starting Ulanzi D200 driver {}", env!("CARGO_PKG_VERSION"));
 
-    // 1. Load configuration
+    // The driver only runs as an OpenDeck plugin (OpenDeck passes -pluginUUID etc.).
+    let Some(uuid) = args.plugin_uuid.clone() else {
+        bail!("This driver is started by OpenDeck (missing -pluginUUID); it is not a standalone program");
+    };
+
+    // 1. Load configuration; a missing or invalid file falls back to the built-in defaults.
     let config = match config::Config::load(&args.config) {
         Ok(c) => c,
         Err(e) => {
-            if args.plugin_uuid.is_some() || args.daemon {
-                warn!(
-                    "Configuration file not found or invalid ({}), using defaults: {}",
-                    args.config.display(),
-                    e
-                );
-                config::Config::default()
-            } else {
-                error!("Failed to load configuration: {}", e);
-                return Err(e);
-            }
+            warn!(
+                "Configuration file not found or invalid ({}), using defaults: {}",
+                args.config.display(),
+                e
+            );
+            config::Config::default()
         }
     };
 
     // Create the cycle command channel
     let (cycle_tx, cycle_rx) = mpsc::channel(1);
 
-    // 2. Determine Communication Mode
-    let (plugin_cmd_rx, hw_event_tx, openaction_handle) = if let Some(ref uuid) = args.plugin_uuid {
-        // PLUGIN MODE (Client)
+    // 2. Connect to OpenDeck
+    let (plugin_cmd_rx, hw_event_tx, openaction_handle) = {
         let port = args.port;
         let event = args
             .register_event
@@ -98,7 +89,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "register".to_string());
         let info_str = args.info.clone().unwrap_or_else(|| "{}".to_string());
 
-        info!("Starting in Plugin Mode (UUID: {}, Port: {})", uuid, port);
+        info!("Connecting to OpenDeck (UUID: {}, Port: {})", uuid, port);
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(100);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
@@ -162,35 +153,20 @@ async fn main() -> Result<()> {
             }
         });
 
-        (Some(cmd_rx), Some(event_tx), Some(oa_handle))
-    } else if args.daemon && args.websocket {
-        warn!("Server Mode is currently disabled/unsupported in this version.");
-        (None, None, None)
-    } else {
-        (None, None, None)
+        (Some(cmd_rx), Some(event_tx), oa_handle)
     };
 
-    // 3. Start Daemon or One-Shot
-    if args.daemon || args.plugin_uuid.is_some() {
-        let daemon = daemon::UlanziDaemon::new(config, plugin_cmd_rx, hw_event_tx, cycle_rx).await?;
+    // 3. Run the daemon until it or the OpenAction runtime ends
+    let daemon = daemon::UlanziDaemon::new(config, plugin_cmd_rx, hw_event_tx, cycle_rx).await?;
 
-        if let Some(oa_handle) = openaction_handle {
-            // Plugin mode: exit when EITHER the daemon or the OpenAction runtime finishes
-            tokio::select! {
-                res = daemon.run() => {
-                    info!("Daemon exited");
-                    res?;
-                }
-                _ = oa_handle => {
-                    info!("OpenAction runtime ended; shutting down driver");
-                }
-            }
-        } else {
-            // Standalone daemon mode: just run until daemon exits (Ctrl-C, etc)
-            daemon.run().await?;
+    tokio::select! {
+        res = daemon.run() => {
+            info!("Daemon exited");
+            res?;
         }
-    } else {
-        info!("No mode specified. Use --daemon or --pluginUUID to start.");
+        _ = openaction_handle => {
+            info!("OpenAction runtime ended; shutting down driver");
+        }
     }
     Ok(())
 }

@@ -7,7 +7,6 @@ use openaction::global_events::{
 use openaction::OpenActionResult;
 use tokio::sync::mpsc;
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum BridgeEvent {
     SetImage {
@@ -23,9 +22,6 @@ pub enum BridgeEvent {
         device_id: String,
         brightness: u8,
     },
-    #[allow(dead_code)]
-    DeviceConnected(String),
-    DeviceDisconnected(String),
 }
 
 pub struct OpenActionBridge {
@@ -91,19 +87,11 @@ impl GlobalEventHandler for OpenActionBridge {
 
     async fn device_did_connect(&self, event: DeviceDidConnectEvent) -> OpenActionResult<()> {
         info!("Device Connected: {}", event.device);
-        let _ = self
-            .tx
-            .send(BridgeEvent::DeviceConnected(event.device))
-            .await;
         Ok(())
     }
 
     async fn device_did_disconnect(&self, event: DeviceDidDisconnectEvent) -> OpenActionResult<()> {
         info!("Device Disconnected: {}", event.device);
-        let _ = self
-            .tx
-            .send(BridgeEvent::DeviceDisconnected(event.device))
-            .await;
         Ok(())
     }
 }
