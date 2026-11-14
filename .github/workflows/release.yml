@@ -32,7 +32,7 @@ jobs:
         run: |
           cargo build --release --locked
           OUT_ZIP="com.glmagalhaes.ulanzi.d200-${GITHUB_REF_NAME}-linux-x86_64.zip" bash pack.sh release
-          sha256sum com.glmagalhaes.ulanzi.d200-*.zip > SHA256SUMS
+          sha256sum com.glmagalhaes.ulanzi.d200-*.zip 40-opendeck-ulanzi.rules > SHA256SUMS
           cat SHA256SUMS
       - name: Publish GitHub release
         env:
@@ -42,4 +42,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes "${notes:-See CHANGELOG.md}" \
-            com.glmagalhaes.ulanzi.d200-*.zip SHA256SUMS
+            com.glmagalhaes.ulanzi.d200-*.zip 40-opendeck-ulanzi.rules SHA256SUMS
